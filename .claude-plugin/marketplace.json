@@ -1,0 +1,6 @@
+{
+  "name": "feride",
+  "owner": { "name": "canerapis" },
+  "description": "Feride modu: patron Feride işe göre Clawd ekibini kurar, modelleri kalan limite göre seçer.",
+  "plugins": [{ "name": "feride", "source": "./" }]
+}

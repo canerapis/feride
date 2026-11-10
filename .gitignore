@@ -1,0 +1,8 @@
+# Claude Code'un mod yüklenince ürettiği tür dosyaları
+.claude-plugin/types/
+
+# Feride ile yapılan deneme işlerinin çıktıları (eklentinin parçası değil)
+kelime_say.py
+test_kelime_say.py
+ornek.txt
+__pycache__/

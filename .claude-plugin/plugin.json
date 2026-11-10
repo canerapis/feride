@@ -1,0 +1,12 @@
+{
+  "name": "feride",
+  "version": "0.1.0",
+  "description": "Patron Feride işe göre Clawd ekibini kurar, modelleri kalan limite göre seçer; ofis panosunda çizgi film gibi izlenir.",
+  "author": {
+    "name": "canerapis",
+    "url": "https://github.com/canerapis"
+  },
+  "repository": "https://github.com/canerapis/feride",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
