@@ -1540,7 +1540,7 @@ export const register: Register = on => {
       await modAyarla($, false)
       await $.ui.close({ id: PANE }).catch(() => undefined)
 
-      return { text: 'Feride modu kapandı: Feride izne çıktı, ekip dağıldı. Geri çağırmak için /feride aç.' }
+      return { text: 'Feride modu kapandı: yeni ekip kurulmaz; çalışan bir ekip varsa işini bitirir. Geri çağırmak için /feride aç.' }
     }
 
     if (anahtar === 'aç' || anahtar === 'ac' || anahtar === 'on') {
