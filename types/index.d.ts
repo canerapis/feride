@@ -1,6 +1,16 @@
-export type Seviye = 'usta' | 'kalfa' | 'cirak'
+/** üstat yalnızca "güçlü" şablonda ve düz metin olmayan zor işlerde verilir. */
+export type Seviye = 'ustat' | 'usta' | 'kalfa' | 'cirak'
 
 export type Durum = 'bekliyor' | 'calisiyor' | 'bitti' | 'hata'
+
+/** Ekibin model cömertliği: limit eşikleri, tavan seviye ve ayrılan pay buna göre değişir. */
+export type Sablon = 'hafif' | 'orta' | 'guclu'
+
+/** Üyenin işinin türü: düz metin işine en üst model verilmez. */
+export type IsTuru = 'metin' | 'kod' | 'arastirma' | 'inceleme' | 'genel'
+
+/** Üyenin o an ne yaptığı (son araç çağrısından): kartındaki animasyonu seçer. */
+export type Etkinlik = 'oku' | 'ara' | 'yaz' | 'komut' | 'web' | 'dusun'
 
 export type Uye = {
   id: string
@@ -9,17 +19,20 @@ export type Uye = {
   yetkinlikler: string[]
   /** Feride'nin istediği seviye. */
   istenen: Seviye
-  /** Limitlere göre verilen seviye. */
+  /** Şablona ve limitlere göre verilen seviye. */
   seviye: Seviye
   model: string
   gerekce: string
   asama: number
   gorev: string
   kritik: boolean
+  /** Eski sürümün kaydında yoktur: yokken 'genel' sayılır. */
+  isTuru?: IsTuru
   durum: Durum
   agentId?: string
-  /** Üyenin son araç çağrısı, panoda düşünce balonu olarak. */
+  /** Üyenin son araç çağrısı, kartında yazı olarak. */
   sonIs?: string
+  etkinlik?: Etkinlik
   rapor?: string
   /** Raporun LAF satırı: iş bitince panoda söylediği söz. */
   laf?: string
@@ -31,9 +44,11 @@ export type LimitOkuma = { tur: string; yuzde: number; sifirlanma?: string }
 
 export type Is = {
   id: string
-  /** Ekibi kuran ekip_kur çağrısının tool_use_id'si: sohbetteki satırı canlı sahne olur. */
+  /** Ekibi kuran ekip_kur çağrısının tool_use_id'si. */
   cagri?: string
   ozet: string
+  /** Eski sürümün kaydında yoktur: yokken 'orta' sayılır. */
+  sablon?: Sablon
   asama: number
   asamaSayisi: number
   uyeler: Uye[]
@@ -60,6 +75,7 @@ declare module 'claude-code' {
       acik: boolean
       is: Is | null
       limitler: LimitOkuma[]
+      sablon: Sablon
     }
   }
 }

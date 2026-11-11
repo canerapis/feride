@@ -91,8 +91,10 @@ Feride gerçek bir iş gördüğünde ekibi kendisi kurar. Selamlaşma, tek sat�
 | `/feride kapat` | Modu ve paneli kapatır. Yeni ekip kurulmaz; çalışan bir ekip varsa işini bitirir. `kapa` ve `off` da çalışır. |
 | `/feride durum` | Mod durumunu, işi, aşamayı, üyeleri, limit kararını ve limit yüzdelerini yazar. |
 | `/feride sıfırla` | İş kaydını ve panoyu temizler. Mod açık ya da kapalı, olduğu gibi kalır. `sifirla` da çalışır. |
+| `/feride şablon` | Geçerli şablonu ve seçenekleri gösterir. |
+| `/feride şablon hafif` \| `orta` \| `güçlü` | Ekibin model cömertliğini seçer. Kısaca `/feride güçlü` de olur. |
 
-Mod açık mı kapalı mı, oturumlar arasında hatırlanır. `/feride kapat` dediyseniz yeni oturumlarda da kapalı kalır, ta ki `/feride aç` diyene kadar.
+Mod açık mı kapalı mı ve hangi şablonun seçili olduğu oturumlar arasında hatırlanır. `/feride kapat` dediyseniz yeni oturumlarda da kapalı kalır, ta ki `/feride aç` diyene kadar.
 
 ## İş verme örnekleri
 
@@ -113,32 +115,70 @@ Feride işi birbirinden bağımsız görevlere böler. Aynı aşamadaki üyeler 
 
 ## Ofis paneli
 
-Masaüstü uygulamasında panel animasyonlu bir ofistir: Feride masasında, konuşma balonu, limit panosu, iş şeridi, aşama noktaları ve rozetli Clawd'lar. Terminalde aynı bilgiler metin ve karakterlerle çizilir.
+Masaüstü uygulamasında panel iki bölümdür. Terminalde aynı bilgiler metin ve karakterlerle çizilir.
 
-- Panel boyuna göre uzar. Dar ve uzun panelde küçük ekipler tek sütunda, daha iri çizilir.
-- Her Clawd'ın rozeti seviyesini ve modelini gösterir. Çalışırken son yaptığı iş düşünce balonunda görünür.
-- Clawd'lar birbirine laf atar; Feride de araya girip azarlar. İş bitince her üye raporundaki "LAF" satırını söyler.
+**Üstte bina.** Sahne bir ajans binasının kesitidir. Çatıda büyük bir tabela durur: limit panosu, seçili şablon ve Feride'nin modeli. En üst kat yönetimdir: Feride masasında oturur. Altında departman katları vardır; her üye işinin türüne göre kendi departmanının katında oturur: Yazılım, Metin Yazarlığı, Araştırma, Kalite Kontrol ya da Genel İşler. Sağda asansör durur. Kimse yerinde durmaz, her dokuz saniyede bir olay olur:
+
+- **Atışma:** Bir Clawd masasından kalkıp ötekinin yanına gider ve laf atar, öteki cevap verir. Başka kattaysa asansöre biner, o kata iner ya da çıkar. Feride yönetim katından kâğıt topu fırlatır, laf atan yerine kaçar.
+- **Denetim:** Feride masasından kalkar, asansörle o kata iner ve birinin başına dikilir. Denetlenen ter döker. Feride'nin ekibe yazdığı "Feride: ..." sözleri de böyle, üyenin başında söylenir.
+- **Rapor teslimi:** İşini bitiren, dosyasını hâlâ çalışan birinin katına ya da yönetim katına, Feride'nin masasına götürür.
+- İş başlarken brifler Feride'nin masasından katlara uçar; iş bitince Feride raporu kaşeler, ekip konfeti altında zıplar.
+
+**Altta üye kartları.** Her üyenin kendi kartı vardır ve o an yaptığı işi canlandırır: dosya okurken kitabının sayfalarını çevirir, arama yaparken dev bir büyüteçle bakar, kod yazarken klavyesinden kod parçaları fırlar, komut çalıştırırken çarklı bir makinenin kolunu çeker, internette gezerken dünyaya olta atar, düşünürken tepesindeki ampul yanıp söner. Kartta üyenin seviyesi, modeli, durumu ve görevi yazar; son yaptığı iş kartların altında ayrı bir satırda akar.
+
+- Çizimler panelin enini doldurur; paneli genişlettikçe büyür.
+- Olaylar binanın kendi içinde döner; çizimin kendisi yalnızca bir şey gerçekten değişince (biri bitirince, aşama ilerleyince) değişir, bu yüzden yanıp sönmez. Panel dokuz saniyede bir güncellenir ama değişmeyen çizimler aynı kalır. Karşılığında bilgi birkaç saniye geriden gelir: bir üyenin son yaptığı iş kartların altında yazıyla, dokuz saniyede bir güncellenir; kartındaki canlandırma en erken on beş saniyede bir değişir.
+- İş bitince her üyenin raporundaki "LAF" satırı kendi kartında yazar; binada içlerinden biri onu balonla söyler.
 - Sahne yalnızca panelde çizilir, sohbetin içinde çizilmez; sohbet sade kalır.
-- Panelde iki düğme var: **Modu aç / Modu kapat** ve iş bitince çıkan **Panoyu temizle** (`/feride sıfırla` ile aynı).
+- Panelde üç düğme var: **Modu aç / Modu kapat**, sıradaki şablona geçen **Şablon** ve iş bitince çıkan **Panoyu temizle** (`/feride sıfırla` ile aynı).
 
 ## Model seçimi ve limitler
 
-Her üye üç seviyeden birinde çalışır:
+### Feride'nin kendi modeli
+
+Mod açıkken Feride (ana oturum) her zaman en üst modelde, **fable**'da çalışır; oturumu hangi modelle açtığınız fark etmez. 5 saatlik ya da 7 günlük limitlerden biri **%99**'a varınca bir alttaki modele, **opus**'a iner; limit sıfırlanınca yeniden fable'a çıkar. Ajanların modeline bu kural dokunmaz. Hesabınızda fable yoksa Feride iki denemeden sonra vazgeçer ve oturumun kendi modeliyle devam eder. `/feride kapat` dediğinizde oturumunuzun modeli olduğu gibi kalır.
+
+### Ekibin seviyeleri
+
+Her üye dört seviyeden birinde çalışır:
 
 | Seviye | Model | Ne için |
 | --- | --- | --- |
-| usta | opus | Mimari, zor akıl yürütme, son kalite kontrolü |
+| üstat | fable | Yalnızca gerçekten gerektiren iş: çok zor akıl yürütme, mimari karar, inatçı hata |
+| usta | opus | Zor uygulama, son kalite kontrolü |
 | kalfa | sonnet | Uygulama, yazım, inceleme |
 | çırak | haiku | Tarama, arama, özet, mekanik iş |
 
-Feride önce işin istediği seviyeyi seçer, sonra limite bakıp gerekirse düşürür. Karar, 5 saatlik ve 7 günlük pencerelerden kalan **en düşük** yüzdeye göre verilir:
+Feride her üyenin işinin türünü de yazar: metin, kod, araştırma ya da inceleme. **Düz metin işine (yazı, özet, çeviri, belge) üstat verilmez**, en fazla usta verilir. Türü belirtilmemiş işe de üstat verilmez.
+
+### Şablonlar
+
+Şablon, ekibin ne kadar cömert kurulacağını belirler. `/feride şablon <ad>` ile ya da paneldeki **Şablon** düğmesiyle değiştirilir; varsayılan **orta**'dır.
+
+| Şablon | Tavan | Herkes çırak | Tavan kalfa | Tek usta | 5 saatlik pencereden pay | Diğer pencerelerden pay |
+| --- | --- | --- | --- | --- | --- | --- |
+| hafif | kalfa (sonnet) | kalan %25'in altında | hep | – | kalanın %30'u | kalanın 1,5 katı |
+| orta | usta (opus) | kalan %15'in altında | kalan %30'un altında | kalan %60'ın altında | kalanın %50'si | kalanın 2,5 katı |
+| güçlü | üstat (fable) | kalan %5'in altında | kalan %10'un altında | kalan %25'in altında | kalanın %90'ı | kalanın 5 katı |
+
+Eşikler, pencerelerden kalan **en düşük** yüzdeye uygulanır. Pay, ekibin tahmini harcamasına ayrılan bütçedir ve 5 saatlik pencerenin yüzdesi cinsinden ölçülür: 7 günlük pencerenin (ve varsa harcama limitinin) yüzde biri, 5 saatlik pencerenin kabaca yüzde onu sayılır, "katı" bu yüzden. Bütçe, bu iki paydan küçük olanıdır.
+
+- **hafif** limiti korur: çoğu iş çırakta, en fazla kalfa.
+- **orta** dengelidir: gerektiğinde usta, limit daraldıkça kademe iner.
+- **güçlü** limiti riske atar: zor işe üstat verilebilir ve seviyeler ancak limit bitmek üzereyken iner. Limitiniz daha çabuk tükenir.
+
+Bir iş için ayrıca şablon isteyebilirsiniz: "bunu güçlü ekiple yap" derseniz Feride yalnızca o işi güçlü şablonla kurar, kalıcı seçiminiz değişmez.
+
+### Limite göre düşürme
+
+Feride önce işin istediği seviyeyi seçer, sonra şablonun tavanını ve limiti uygular. Karar, 5 saatlik ve 7 günlük pencerelerden kalan **en düşük** yüzdeye göre verilir. Orta şablonda:
 
 - Kalan %15'in altındaysa herkes çırak olur.
 - Kalan %30'un altındaysa en fazla kalfa verilir.
 - Kalan %60'ın altındaysa en fazla bir usta kalır (kritik işaretli üye varsa o).
 - 5 saatlik pencere 20 dakikadan kısa sürede sıfırlanacaksa kalan en az %70 sayılır.
 
-Feride ayrıca ekibin harcamasını tahmin eder: usta 3, kalfa 1, çırak 0,3 birim, ölçülen bir katsayıyla çarpılır. Bütçe, 5 saatlik pencerede kalanın yarısı ile diğer pencerede kalanın 2,5 katından küçük olanıdır. Harcama limitiniz varsa o da hesaba katılır. Tahmin bütçeyi aşarsa önce kritik olmayan, sonra en pahalı üye bir kademe düşürülür. Katsayı, iş aynı 5 saatlik pencerede bittiyse ölçülen kullanıma göre güncellenir. Aynı anda başka işler de yapıyorsanız ölçüm şişebilir.
+Feride ayrıca ekibin harcamasını tahmin eder: üstat 5, usta 3, kalfa 1, çırak 0,3 birim, ölçülen bir katsayıyla çarpılır. Bütçe, şablonun ekibe ayırdığı paydır (yukarıdaki tablo). Tahmin bütçeyi aşarsa önce kritik olmayan, sonra en pahalı üye bir kademe düşürülür. "Kritik", Feride'nin ekibi kurarken işaretlediği üyedir: işin kalitesi ona bağlıdır, bu yüzden seviyesi en son düşürülür. Katsayı 1'den başlar. Katsayı, iş aynı 5 saatlik pencerede bittiyse ölçülen kullanıma göre güncellenir. Aynı anda başka işler de yapıyorsanız ölçüm şişebilir.
 
 Ekibi kurarken Feride size limit kararını da söyler. Örneğin: "dar boğaz %18: tavan kalfa · tahmini harcama ≈ %2".
 

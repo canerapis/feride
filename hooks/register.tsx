@@ -1,7 +1,26 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, ResolveInput, Timer } from 'claude-code'
 
-import type { Durum, Is, LimitOkuma, Seviye, Uye } from '../types'
+import type { Durum, Etkinlik, Is, IsTuru, LimitOkuma, Sablon, Seviye, Uye } from '../types'
+import { FERIDE_BOS, FERIDE_KAPALI, kartSvg, sahne, sahneSvg } from './cizim'
+import {
+  DURUM_ADI,
+  MODEL,
+  SABLON,
+  SABLON_SIRASI,
+  SEVIYE_ADI,
+  etkinlikBul,
+  kisalt,
+  limitAdi,
+  limitleriOku,
+  modelSec,
+  patronModeli,
+  sablonOku,
+  sinirla,
+  sureMetni,
+  temiz,
+} from './ortak'
+import type { Taslak } from './ortak'
 
 const PANE = 'feride-ofis'
 const BASLIK = "Feride'nin Ofisi"
@@ -10,9 +29,15 @@ const PANO_ACILISI = { id: PANE, title: BASLIK, rows: 30, columns: 96 } as const
 const ARAC = 'mcp__feride__ekip_kur'
 const RAPOR_BASLIGI = 'FERİDE EKİP RAPORU'
 
-// Saat her vuruşta panoyu bir kare ilerletir. Çizimdeki bütün SMIL döngüleri
-// (0.5 s, 1 s, 1.5 s, 3 s) bu süreyi böler: yeniden çizim döngüyü bozmaz.
+// Saat üç saniyede bir vurur: ölen ajanı yakalamak için sık, panoyu yeniden
+// çizmek için seyrek (bkz. vurus). Sahnedeki olaylar SVG'nin kendi içinde döner.
 const TIK_MS = 3_000
+/** Pano kaç vuruşta bir güncellenir (9 sn). */
+const PANO_VURUSU = 3
+/** Bir üyenin kartındaki canlandırma en erken bu kadar sonra değişir. */
+const ETKINLIK_ARASI = 15_000
+/** Masaüstünde bir hücrenin CSS pikseli cinsinden tahmini eni. */
+const PIKSEL_HUCRE = 7.5
 const RAPOR_SINIRI = 6_000
 const TOPLU_RAPOR_SINIRI = 40_000
 const EN_COK_UYE = 8
@@ -20,244 +45,7 @@ const EN_COK_UYE = 8
 const acikAtom = atom({ plugin: 'feride', key: 'acik' } as const, true)
 const isAtom = atom({ plugin: 'feride', key: 'is' } as const, null)
 const limitAtom = atom({ plugin: 'feride', key: 'limitler' } as const, [])
-
-// ---------------------------------------------------------------------------
-// Seviyeler ve modeller
-// ---------------------------------------------------------------------------
-
-const MODEL: Record<Seviye, string> = { usta: 'opus', kalfa: 'sonnet', cirak: 'haiku' }
-const SEVIYE_ADI: Record<Seviye, string> = { usta: 'usta', kalfa: 'kalfa', cirak: 'çırak' }
-const BIR_ALT: Record<Seviye, Seviye> = { usta: 'kalfa', kalfa: 'cirak', cirak: 'cirak' }
-const SIRA: Record<Seviye, number> = { usta: 2, kalfa: 1, cirak: 0 }
-
-// Bir üyenin tahmini harcaması, 5 saatlik pencerenin yüzdesi olarak. Gerçek
-// harcama her iş bitiminde ölçülür ve `katsayi` ile düzeltilir ($.store).
-const MALIYET: Record<Seviye, number> = { usta: 3, kalfa: 1, cirak: 0.3 }
-// Haftalık pencerenin yüzde biri, 5 saatlik pencerenin kabaca kaç yüzdesi eder.
-const HAFTA_ORANI = 10
-
-type Taslak = {
-  ad: string
-  rol: string
-  yetkinlikler: string[]
-  istenen: Seviye
-  asama: number
-  gorev: string
-  kritik: boolean
-}
-
-type Secim = { seviye: Seviye; gerekce: string }
-
-type Atama = { secimler: Secim[]; not: string; tahmin: number; tabanTahmin: number }
-
-const sayi = (n: number): string => String(Math.round(n * 10) / 10).replace('.', ',')
-
-const sinirla = (n: number, alt: number, ust: number): number => Math.min(ust, Math.max(alt, n))
-
-function limitAdi(tur: string): string {
-  if (tur === 'five_hour') return '5 saat'
-  if (tur === 'seven_day') return '7 gün'
-  if (tur === 'spend_limit') return 'harcama'
-
-  return tur
-}
-
-function limitleriOku(ham: readonly { kind: string; percentUsed: number; resetsAt?: string }[]): LimitOkuma[] {
-  return ham.map(bir => ({
-    tur: bir.kind,
-    yuzde: sinirla(Math.round(bir.percentUsed), 0, 100),
-    ...(bir.resetsAt === undefined ? {} : { sifirlanma: bir.resetsAt }),
-  }))
-}
-
-const BIRLER_EKI = ['ı', 'i', 'si', 'ü', 'ü', 'i', 'sı', 'si', 'i', 'u']
-const ONLAR_EKI = ['ı', 'u', 'si', 'u', 'ı', 'si', 'ı', 'i', 'i', 'ı']
-
-/** "%69'u", "%40'ı", "%1,6'sı": sayının okunuşundaki son kelimeye göre iyelik eki. */
-function yuzdesi(metin: string): string {
-  const rakamlar = metin.replace(/\D/g, '')
-  const son = Number(rakamlar.at(-1) ?? '0')
-  const onlar = Number(rakamlar.at(-2) ?? '0')
-  const ek =
-    son !== 0 ? BIRLER_EKI[son] : /^100$/.test(metin) ? 'ü' : onlar !== 0 && !metin.includes(',') ? ONLAR_EKI[onlar] : 'ı'
-
-  return `%${metin}'${ek ?? 'ı'}`
-}
-
-/**
- * Kalan limite göre her üyenin seviyesini (dolayısıyla modelini) seçer.
- *
- * Önce dar boğaza göre tavan kuralları, sonra bütçe: ekibin tahmini harcaması
- * kalan payı aşıyorsa kritik olmayanlardan başlayarak birer kademe indirilir.
- */
-function modelSec(taslaklar: readonly Taslak[], limitler: readonly LimitOkuma[], simdi: number, katsayi: number): Atama {
-  const secimler: Secim[] = taslaklar.map(t => ({ seviye: t.istenen, gerekce: 'istenen seviye verildi' }))
-  const taban = (): number => secimler.reduce((toplam, s) => toplam + MALIYET[s.seviye], 0)
-
-  if (limitler.length === 0) {
-    return {
-      secimler,
-      not: 'Limit bilgisi okunamadı (abonelik dışı oturum olabilir): istenen seviyeler aynen verildi.',
-      tahmin: taban() * katsayi,
-      tabanTahmin: taban(),
-    }
-  }
-
-  const parcalar: string[] = []
-  let dar = 100
-  let butce = Number.POSITIVE_INFINITY
-
-  for (const limit of limitler) {
-    let kalan = 100 - limit.yuzde
-    const sifirlanma = limit.sifirlanma === undefined ? Number.NaN : Date.parse(limit.sifirlanma)
-    const yakinda = limit.tur === 'five_hour' && sifirlanma - simdi > 0 && sifirlanma - simdi < 20 * 60_000
-
-    parcalar.push(`${limitAdi(limit.tur)} penceresinin ${yuzdesi(String(kalan))} boşta${yakinda ? ' (birazdan sıfırlanıyor)' : ''}`)
-    // Sıfırlanmasına az kalmış pencere dar boğaz sayılmaz: artan pay yanar.
-    if (yakinda) kalan = Math.max(kalan, 70)
-    dar = Math.min(dar, kalan)
-    butce = Math.min(butce, limit.tur === 'five_hour' ? kalan * 0.5 : kalan * 0.25 * HAFTA_ORANI)
-  }
-
-  const indir = (i: number, hedef: Seviye, neden: string): void => {
-    const secim = secimler[i]
-    const taslak = taslaklar[i]
-
-    if (secim === undefined || taslak === undefined || SIRA[secim.seviye] <= SIRA[hedef]) return
-    secimler[i] = { seviye: hedef, gerekce: `${SEVIYE_ADI[taslak.istenen]} istenmişti; ${neden}` }
-  }
-
-  let kural = 'istenen seviyeler karşılanabiliyor'
-
-  if (dar < 15) {
-    kural = `dar boğaz %${dar}: herkes çırak`
-    secimler.forEach((_, i) => indir(i, 'cirak', `limitin yalnızca ${yuzdesi(String(dar))} kaldı, herkes çırak`))
-  } else if (dar < 30) {
-    kural = `dar boğaz %${dar}: tavan kalfa`
-    secimler.forEach((_, i) => indir(i, 'kalfa', `limitin ${yuzdesi(String(dar))} kaldı, tavan kalfa`))
-  } else if (dar < 60) {
-    kural = `dar boğaz %${dar}: en fazla bir usta`
-    const ustalar = secimler.flatMap((s, i) => (s.seviye === 'usta' ? [i] : []))
-    const kalacak = ustalar.find(i => taslaklar[i]?.kritik === true) ?? ustalar[0]
-
-    for (const i of ustalar) if (i !== kalacak) indir(i, 'kalfa', `limitin ${yuzdesi(String(dar))} kaldı, tek usta hakkı var`)
-  }
-
-  let kesinti = 0
-
-  while (taban() * katsayi > butce) {
-    // Önce kritik olmayan, sonra en pahalı, sonra en son aşamadaki.
-    let aday = -1
-
-    secimler.forEach((s, i) => {
-      if (s.seviye === 'cirak') return
-      if (aday === -1) {
-        aday = i
-
-        return
-      }
-
-      const eski = secimler[aday]
-      const kritik = taslaklar[i]?.kritik === true
-      const eskiKritik = taslaklar[aday]?.kritik === true
-
-      if (eski === undefined) return
-      if (kritik !== eskiKritik) {
-        if (!kritik) aday = i
-
-        return
-      }
-
-      if (SIRA[s.seviye] >= SIRA[eski.seviye]) aday = i
-    })
-
-    const secim = secimler[aday]
-
-    if (secim === undefined) break
-    indir(aday, BIR_ALT[secim.seviye], `ekibin tahmini harcaması kalan payı (%${sayi(butce)}) aşıyordu`)
-    kesinti += 1
-  }
-
-  const tahmin = taban() * katsayi
-  const pay = Number.isFinite(butce) ? ` (ayrılan pay %${sayi(butce)})` : ''
-
-  return {
-    secimler,
-    not:
-      `${parcalar.join(', ')}. Kural: ${kural}${kesinti > 0 ? `; bütçe için ${kesinti} kademe indirildi` : ''}. ` +
-      `Tahmini harcama: 5 saatlik pencerenin ≈${yuzdesi(sayi(tahmin))}${pay}.`,
-    tahmin,
-    tabanTahmin: taban(),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Metin yardımcıları
-// ---------------------------------------------------------------------------
-
-const temiz = (metin: string): string =>
-  metin
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-const kisalt = (metin: string, en: number): string =>
-  metin.length <= en ? metin : `${metin.slice(0, Math.max(0, en - 1)).trimEnd()}…`
-
-const kacis = (metin: string): string =>
-  metin.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-
-function karma(metin: string): number {
-  let h = 2166136261
-
-  for (let i = 0; i < metin.length; i += 1) {
-    h ^= metin.charCodeAt(i)
-    h = Math.imul(h, 16777619)
-  }
-
-  return h >>> 0
-}
-
-const sec = <T,>(liste: readonly T[], h: number): T | undefined => liste[h % Math.max(1, liste.length)]
-
-function sar(metin: string, en: number, enCok: number): string[] {
-  const satirlar: string[] = []
-  let satir = ''
-
-  for (const kelime of temiz(metin).split(' ')) {
-    let k = kelime
-
-    while (k.length > en) {
-      if (satir !== '') satirlar.push(satir)
-      satir = ''
-      satirlar.push(k.slice(0, en))
-      k = k.slice(en)
-    }
-
-    if (k === '') continue
-    if (satir === '') satir = k
-    else if (satir.length + 1 + k.length <= en) satir = `${satir} ${k}`
-    else {
-      satirlar.push(satir)
-      satir = k
-    }
-  }
-
-  if (satir !== '') satirlar.push(satir)
-  if (satirlar.length <= enCok) return satirlar
-
-  const kesik = satirlar.slice(0, enCok)
-
-  kesik[enCok - 1] = `${kisalt(kesik[enCok - 1] ?? '', en - 1)}…`
-
-  return kesik
-}
-
-function sureMetni(ms: number): string {
-  const sn = Math.max(0, Math.round(ms / 1000))
-
-  return sn < 60 ? `${sn} sn` : `${Math.floor(sn / 60)} dk ${sn % 60} sn`
-}
+const sablonAtom = atom({ plugin: 'feride', key: 'sablon' } as const, 'orta')
 
 // ---------------------------------------------------------------------------
 // Plan: Feride'nin araca verdiği ekip
@@ -265,17 +53,32 @@ function sureMetni(ms: number): string {
 
 const YEDEK_ADLAR = ['Ayşe', 'Mehmet', 'Zeynep', 'Can', 'Elif', 'Deniz', 'Ece', 'Mert']
 
-type Plan = { ozet: string; taslaklar: Taslak[]; atismalar: string[] }
+type Plan = { ozet: string; taslaklar: Taslak[]; atismalar: string[]; sablon?: Sablon }
 
 const yazi = (deger: unknown, en: number): string => (typeof deger === 'string' ? kisalt(deger.trim(), en) : '')
 
-function seviyeOku(deger: unknown): Seviye {
-  const s = typeof deger === 'string' ? deger.toLowerCase().replace(/ç/g, 'c').replace(/ı/g, 'i').trim() : ''
+const duz = (deger: unknown): string =>
+  typeof deger === 'string' ? deger.toLowerCase().replace(/ç/g, 'c').replace(/ı/g, 'i').replace(/ü/g, 'u').replace(/ş/g, 's').trim() : ''
 
+function seviyeOku(deger: unknown): Seviye {
+  const s = duz(deger)
+
+  if (s === 'ustat' || s === 'fable') return 'ustat'
   if (s === 'usta' || s === 'opus' || s === 'senior') return 'usta'
   if (s === 'cirak' || s === 'haiku' || s === 'junior') return 'cirak'
 
   return 'kalfa'
+}
+
+function isTuruOku(deger: unknown): IsTuru {
+  const s = duz(deger)
+
+  if (s === 'metin' || s === 'yazi' || s === 'icerik') return 'metin'
+  if (s === 'kod') return 'kod'
+  if (s === 'arastirma' || s === 'analiz') return 'arastirma'
+  if (s === 'inceleme' || s === 'test' || s === 'denetim') return 'inceleme'
+
+  return 'genel'
 }
 
 function diziOku(deger: unknown): unknown[] {
@@ -329,6 +132,7 @@ function planOku(girdi: Record<string, unknown>): Plan | string {
       asama,
       gorev,
       kritik: u.kritik === true,
+      isTuru: isTuruOku(u.tur),
     })
   }
 
@@ -338,6 +142,8 @@ function planOku(girdi: Record<string, unknown>): Plan | string {
   for (const t of taslaklar) t.asama = basamaklar.indexOf(t.asama) + 1
   taslaklar.sort((a, b) => a.asama - b.asama)
 
+  const sablon = sablonOku(girdi.sablon)
+
   return {
     ozet,
     taslaklar,
@@ -345,6 +151,7 @@ function planOku(girdi: Record<string, unknown>): Plan | string {
       .map(a => temiz(yazi(a, 90)))
       .filter(a => a !== '')
       .slice(0, 12),
+    ...(sablon === undefined ? {} : { sablon }),
   }
 }
 
@@ -365,7 +172,9 @@ Karakterin: ruhsuz, mobbingci, kendi hayatı olmayan, işle kafayı bozmuş bir 
 ## Ekip nasıl kurulur
 - Önce işi anla (gerekirse birkaç dosyaya ya da kaynağa hızlıca bak), sonra birbirinden bağımsız görevlere böl.
 - İşe yetecek kadar üye seç (çoğu iş için 2-5). Her üyeye kısa bir Türkçe ad, rol, 2-4 yetkinlik, seviye ve görev yaz. Üye bu konuşmayı görmez: görev metnine dosya yollarını, kısıtları ve beklenen çıktıyı açıkça yaz.
-- Seviye: \`usta\` en güçlü ve en pahalı model (mimari, zor akıl yürütme, son kalite kontrolü); \`kalfa\` dengeli (uygulama, yazım, inceleme); \`çırak\` hızlı ve ucuz (tarama, arama, özet, mekanik iş). Gerektiği kadarını iste: modeli kalan kullanım limitine göre araç seçer ve gerekirse seviyeyi düşürür. Düşürülmemesi gereken üyeye \`kritik: true\` ver.
+- Seviye: \`üstat\` en üst model (fable), yalnızca gerçekten gerektiren iş için: çok zor akıl yürütme, mimari karar, inatçı hata; \`usta\` güçlü model (opus: zor uygulama, son kalite kontrolü); \`kalfa\` dengeli (sonnet: uygulama, yazım, inceleme); \`çırak\` hızlı ve ucuz (haiku: tarama, arama, özet, mekanik iş). Gerektiği kadarını iste: modeli geçerli şablona ve kalan kullanım limitine göre araç seçer, gerekirse seviyeyi düşürür. Düşürülmemesi gereken üyeye \`kritik: true\` ver.
+- Her üyeye işinin türünü yaz (\`tur\`): \`metin\` (düz metin yazma, özet, çeviri, belge, slogan), \`kod\`, \`arastirma\`, \`inceleme\` (kod incelemesi, test, doğrulama). Tür, üyenin binadaki departmanını da belirler: her tür ayrı bir katta oturur. Düz metin işine \`üstat\` isteme: araç zaten vermez. Durduk yere en pahalı modeli isteme; metin işinin çoğu kalfayla, mekanik olanı çırakla biter.
+- \`sablon\` alanını yalnızca kullanıcı bu iş için açıkça başka bir şablon istediyse doldur ("bunu güçlü ekiple yap" gibi); yoksa boş bırak, geçerli şablon kullanılır.
 - İş akışı: \`asama\` numarası aynı olanlar paralel çalışır; sonraki aşama öncekilerin raporlarını kendiliğinden alır. Örnek: 1 keşif, 2 uygulama, 3 doğrulama. Aynı dosyayı aynı aşamada iki üyeye yazdırma.
 - \`atismalar\`: ekibin panoda birbirine takılacağı, bu işe özel 4-8 kısa (en çok 60 karakter) esprili söz, "Ad: söz" biçiminde; "Feride: söz" de olabilir. Sert, kara mizah, mobbing parodisi; hakaret ve kişisel özelliklere dayalı espri yok.
 
@@ -453,647 +262,21 @@ function isOzeti(e: { tool: string }): string {
 
     const dosya = anahtar === 'file_path' || anahtar === 'path'
 
-    return kisalt(`${arac}: ${temiz(dosya ? (deger.split(/[\\/]/).pop() ?? deger) : deger)}`, 28)
+    return kisalt(`${arac}: ${temiz(dosya ? (deger.split(/[\\/]/).pop() ?? deger) : deger)}`, 52)
   }
 
-  return kisalt(arac, 28)
+  return kisalt(arac, 52)
 }
 
-// ---------------------------------------------------------------------------
-// Atışmalar
-// ---------------------------------------------------------------------------
-
-type Ikili = readonly [string, string]
-
-const GENEL: readonly Ikili[] = [
-  ['{b}, brief üç satır. Sen yedi revize yaptın.', 'Müşteri "daha pop" dedi {a}, ben ne yapayım?'],
-  ['Ben de 3 gündür uyumadım.', 'Feride Hanım 3 yıldır uyumadı {a}, yarışma değil.'],
-  ['Müşteri biraz daha pop istiyor.', 'Geçen hafta "sade" istemişti {a}.'],
-  ['{b}, cuma akşamı son revize dedi.', 'Geçen cuma da son revizeydi {a}.'],
-  ['Hafta sonu da müsait misin?', 'Hafta sonu diye bir şey var mıydı?'],
-  ['Saat 03:12, ajans grubundan bildirim geldi.', 'Cevap yaz {a}, yoksa "görüldü" olur.'],
-  ['{b}, logoyu büyütelim mi?', 'Büyüttük. Müşteri küçültmek istiyor {a}.'],
-  ['Sunum yarın sabah dokuzda.', 'Hangi yarın? Dünden kalan sunum bu {a}.'],
-  ['Bunu bir de böyle görelim {b}.', 'Bunu üç kere böyle gördük {a}.'],
-  ['Zam istesem Feride Hanım ne der?', 'Der ki: "Deneyim kazanıyorsun {a}."'],
-  ['Öğle yemeğine çıkıyorum {b}.', 'Çıkarsan revize seni bekler {a}.'],
-  ['{b}, moodboard bitti mi?', 'Moodboard bitti, ruh hali bitmedi {a}.'],
-  ['Fontu değiştirdim {b}.', 'Müşteri eskisini seviyormuş {a}. Geri al.'],
-  ['İlham gelmiyor {b}.', 'Brief gelsin, ilham deadline ile gelir {a}.'],
-]
-
-const USTA_CIRAK: readonly Ikili[] = [
-  ['{b}, ben stajdayken sunumu ayakta bitirirdim.', 'Ben henüz o kadar tükenmedim usta.'],
-  ['{b}, kahve al, revizeler seni bekler.', 'Kahve hazır usta, revize üçüncü tur.'],
-  ['Çırak, müşteri pop istiyor, anla!', 'Anladım usta. Pop neydi?'],
-  ['{b}, fikir benim, emek senin.', 'Terfi de benim olur mu usta?'],
-  ['İzin mi? {b}, o kelimeyi nereden duydun?', 'Takvimde gördüm usta, silik yazıyordu.'],
-]
-
-const CIRAK_USTA: readonly Ikili[] = [
-  ['Usta, saat 4, eve gitsem mi?', 'Git {a}. Laptopu da al, VPN açık kalsın.'],
-  ['{b} usta, hafta sonu gönüllüyüm!', 'Gönüllü yok {a}. Takvimde zaten yazıyor.'],
-  ['Usta, bu revizenin kaçıncısı?', 'Sayan biter {a}. Sen yeniden başla.'],
-  ['Usta, bana da brief verir misin?', 'Brief mi? Beni dinle, o brief.'],
-  ['Usta, stajyer maaşı ne zaman?', 'Portfolyona yazarız {a}, o da para sayılır.'],
-]
-
-const CEVAP = [
-  'Not aldım. Revizeye ekledim.',
-  'Bunu müşteri duymasın {a}.',
-  'Feride Hanım okursa mail atar.',
-  'Haklısın, o yüzden yine ben yapacağım.',
-  'Cumaya kadar hallederiz {a}...',
-  'Görüldü. Cevap yazmıyorum.',
-  'Bunu da brife ekleyelim, zaten roman oldu.',
-]
-
-const FERIDE_AZAR = [
-  'Konuşmayın, çalışın. Sohbet müşteriye faturalanamıyor.',
-  '{a}, {b}! Bu enerjiyi revizeye harcayın.',
-  'Ben 3 gündür uyumadım, siz sohbet ediyorsunuz.',
-  'Mesai biter sandınız? Mesai kapanır, iş kapanmaz.',
-  'Müşteri bekliyor, siz fısıldaşıyorsunuz. Cuma akşamı son revize.',
-  'Hafta sonu müsaitsiniz, takvime zaten ekledim.',
-  'Telefonunuz titremiyor, işiniz çağırıyor. Aynı şey.',
-  'Bunu bir de böyle görelim: sessizce ve daha hızlı.',
-  'Ağlayacaksanız masanızda ağlayın, toplantı odası müşteriye ayrıldı.',
-  'Yorgun musunuz? Güzel, yorgunluk da bir içgörü. Sunuma koyun.',
-]
-
-const FERIDE_BOS = 'Buyurun müşterimiz, brief bekliyoruz. Ekibim hazır; ben zaten 3 gündür buradayım. Bir iş verin lütfen.'
-const FERIDE_KAPALI = 'Mod kapalı. Ofisten çıkmadım, çünkü çıkacak bir evim yok. Geri çağırmak için /feride aç yazın.'
-const FERIDE_BITTI = [
-  'Teslim edildi. Müşteri mutlu, ekip hâlâ ayakta; ikisi de benim sayemde.',
-  'Rapor hazır. Ekibe teşekkür etmeyeceğim, alışmasınlar.',
-  'Bitti. Yeni brief gelene kadar kimse uyumasın.',
-  'Sunum tamam. Sıradaki revize yolda, şimdiden hazır olun.',
-]
-const KUTLAMA = [
-  'Bitti! Cuma akşamı çıkış hakkımı kullanıyorum.',
-  'Teslim ettim. Uyuyabilir miyim, sorum geçerli mi?',
-  'Son revize bitti. Yenisi nerede?',
-  'Sunum çıktı. Ben kayboluyorum.',
-]
-
-type Sahne = { sozler: Map<string, string>; feride: string }
-
-/** Bu karede kim ne diyor: yalnızca işin kimliğinden ve kare sayacından türer. */
-function sahne(is: Is): Sahne {
-  const sozler = new Map<string, string>()
-  const uyeler = is.uyeler
-  const dilim = Math.floor(is.tik / 3)
-  const faz = is.tik % 3
-  const h = karma(`${is.id}:${dilim}`)
-
-  if (is.durum === 'tamam') {
-    const lafli = uyeler.filter(u => u.laf !== undefined)
-    const konusan = sec(lafli.length > 0 ? lafli : uyeler, h)
-
-    if (konusan !== undefined) sozler.set(konusan.id, konusan.laf ?? sec(KUTLAMA, h >>> 4) ?? '')
-
-    return { sozler, feride: sec(FERIDE_BITTI, karma(is.id)) ?? '' }
-  }
-
-  const calisan = uyeler.filter(u => u.durum === 'calisiyor')
-  const biten = uyeler.filter(u => u.durum === 'bitti').length
-  const durumSozu = `Aşama ${is.asama}/${is.asamaSayisi}: ${calisan.length} kişi çalışıyor, ${biten} rapor masamda.`
-  let a = sec(calisan.length > 0 ? calisan : uyeler, h)
-
-  if (a === undefined) return { sozler, feride: durumSozu }
-
-  let ozel: string | undefined
-  let ferideSoyluyor = false
-
-  if (is.atismalar.length > 0 && dilim % 2 === 0) {
-    const ham = is.atismalar[(dilim / 2) % is.atismalar.length] ?? ''
-    const parca = /^\s*([^:]{1,24}):\s*(.+)$/.exec(ham)
-    const kim = parca?.[1]?.trim().toLowerCase() ?? ''
-
-    ozel = parca?.[2] ?? ham
-    ferideSoyluyor = kim.startsWith('feride')
-    a = uyeler.find(u => u.ad.toLowerCase() === kim) ?? a
-  }
-
-  const konusan = a
-  const digerleri = uyeler.filter(u => u.id !== konusan.id)
-  const calisanDiger = digerleri.filter(u => u.durum === 'calisiyor')
-  const b = sec(calisanDiger.length > 0 ? calisanDiger : digerleri, h >>> 3)
-  const doldur = (soz: string): string => soz.replace(/\{a\}/g, konusan.ad).replace(/\{b\}/g, b?.ad ?? 'Feride Hanım')
-  const azar = doldur(sec(FERIDE_AZAR, h >>> 9) ?? '')
-
-  if (ozel !== undefined) {
-    const cevap = doldur(sec(CEVAP, h >>> 5) ?? '')
-
-    if (ferideSoyluyor) {
-      if (faz >= 1) sozler.set(konusan.id, cevap)
-
-      return { sozler, feride: ozel }
-    }
-
-    sozler.set(konusan.id, ozel)
-    if (faz >= 1 && b !== undefined) sozler.set(b.id, cevap)
-
-    return { sozler, feride: faz === 2 ? azar : durumSozu }
-  }
-
-  const havuz =
-    konusan.seviye === 'usta' && b?.seviye === 'cirak'
-      ? USTA_CIRAK
-      : konusan.seviye === 'cirak' && b?.seviye === 'usta'
-        ? CIRAK_USTA
-        : GENEL
-  const ikili = sec(havuz, h >>> 6) ?? ['', '']
-
-  sozler.set(konusan.id, doldur(ikili[0]))
-  if (faz >= 1 && b !== undefined) sozler.set(b.id, doldur(ikili[1]))
-
-  return { sozler, feride: faz === 2 || (b === undefined && faz === 1) ? azar : durumSozu }
-}
-
-// ---------------------------------------------------------------------------
-// Çizim: masaüstünde SVG ofis
-// ---------------------------------------------------------------------------
-
-const TURUNCU = '#D97757'
-const KOYU = '#2B2B2B'
-const ROZET: Record<Seviye, { zemin: string; yazi: string }> = {
-  usta: { zemin: '#F2B705', yazi: '#3B2F2F' },
-  kalfa: { zemin: '#5B8DEF', yazi: '#FFFFFF' },
-  cirak: { zemin: '#58B368', yazi: '#FFFFFF' },
-}
-
-type Hal = Durum | 'uyku' | 'patron'
-
-const yuvarla = (n: number): string => String(Math.round(n * 10) / 10)
-
-/**
- * Clawd: 16 x 10,5 birimlik bloklu maskot; `s` bir birimin piksel karşılığı.
- * `sus` gövdeyle birlikte sallanan ekleri taşır (şapka, gözlük, pano).
- */
-function clawd(x: number, y: number, s: number, hal: Hal, sus: string, sallar = false): string {
-  const u = (v: number): string => yuvarla(v * s)
-  const govde = hal === 'hata' ? '#BFA89E' : TURUNCU
-  const dongu = 'repeatCount="indefinite"'
-  const p: string[] = [`<g transform="translate(${yuvarla(x)} ${yuvarla(y)})"><g${hal === 'bekliyor' ? ' opacity="0.8"' : ''}>`]
-
-  if (hal === 'calisiyor') {
-    p.push(`<animateTransform attributeName="transform" type="translate" values="0 0;0 ${u(-0.35)};0 0" dur="0.5s" ${dongu}/>`)
-  } else if (hal === 'bitti') {
-    p.push(`<animateTransform attributeName="transform" type="translate" values="0 0;0 ${u(-1.5)};0 0;0 0" keyTimes="0;0.25;0.5;1" dur="1s" ${dongu}/>`)
-  } else if (hal === 'patron') {
-    p.push(`<animateTransform attributeName="transform" type="translate" values="0 0;0 ${u(-0.2)};0 0" dur="1.5s" ${dongu}/>`)
-  } else if (hal !== 'hata') {
-    p.push(`<animateTransform attributeName="transform" type="translate" values="0 0;0 ${u(0.35)};0 0" dur="3s" ${dongu}/>`)
-  }
-
-  if (hal === 'hata') p.push(`<g transform="rotate(8 ${u(8)} ${u(8)})">`)
-
-  for (const bx of [3, 5.5, 9, 11.5]) {
-    p.push(`<rect x="${u(bx)}" y="${u(7.5)}" width="${u(1.5)}" height="${u(3)}" fill="${govde}"/>`)
-  }
-
-  p.push(`<rect x="${u(2)}" y="0" width="${u(12)}" height="${u(8)}" rx="${u(0.5)}" fill="${govde}"/>`)
-
-  // Kollar: çalışırken sırayla klavyeye iner, iş bitince havada.
-  const kolY = hal === 'bitti' ? 0.6 : 3
-
-  for (const [i, kx] of [0, 14].entries()) {
-    const tus =
-      hal === 'calisiyor'
-        ? `<animate attributeName="y" values="${i === 0 ? `${u(3)};${u(2)};${u(3)}` : `${u(2)};${u(3)};${u(2)}`}" dur="0.5s" ${dongu}/>`
-        : sallar && i === 1
-          ? `<animate attributeName="y" values="${u(3)};${u(1.2)};${u(3)}" dur="1s" ${dongu}/>`
-          : ''
-
-    p.push(`<rect x="${u(kx)}" y="${u(kolY)}" width="${u(2)}" height="${u(2)}" fill="${govde}">${tus}</rect>`)
-  }
-
-  for (const gx of [4.5, 10.5]) {
-    if (hal === 'calisiyor' || hal === 'patron') {
-      p.push(
-        `<rect x="${u(gx)}" y="${u(2)}" width="${u(1)}" height="${u(2)}" fill="${KOYU}">` +
-          `<animate attributeName="height" values="${u(2)};${u(2)};${u(0.3)};${u(2)};${u(2)}" keyTimes="0;0.86;0.9;0.94;1" dur="3s" ${dongu}/>` +
-          `<animate attributeName="y" values="${u(2)};${u(2)};${u(2.85)};${u(2)};${u(2)}" keyTimes="0;0.86;0.9;0.94;1" dur="3s" ${dongu}/></rect>`,
-      )
-    } else if (hal === 'bitti') {
-      p.push(
-        `<path d="M${u(gx - 0.5)} ${u(3.6)} L${u(gx + 0.5)} ${u(2.3)} L${u(gx + 1.5)} ${u(3.6)}" fill="none" stroke="${KOYU}" stroke-width="${u(0.5)}" stroke-linecap="round" stroke-linejoin="round"/>`,
-      )
-    } else if (hal === 'hata') {
-      p.push(
-        `<path d="M${u(gx - 0.3)} ${u(2.2)} L${u(gx + 1.3)} ${u(3.8)} M${u(gx + 1.3)} ${u(2.2)} L${u(gx - 0.3)} ${u(3.8)}" stroke="${KOYU}" stroke-width="${u(0.45)}" stroke-linecap="round"/>`,
-      )
-    } else {
-      p.push(`<rect x="${u(gx - 0.3)}" y="${u(2.9)}" width="${u(1.6)}" height="${u(0.4)}" fill="${KOYU}"/>`)
-    }
-  }
-
-  p.push(sus)
-  if (hal === 'hata') p.push('</g>')
-  p.push('</g></g>')
-
-  return p.join('')
-}
-
-function sapka(seviye: Seviye, s: number): string {
-  const u = (v: number): string => yuvarla(v * s)
-
-  if (seviye === 'usta') {
-    // Baret.
-    return (
-      `<path d="M${u(3.6)} ${u(0.2)} Q${u(8)} ${u(-4.6)} ${u(12.4)} ${u(0.2)} Z" fill="#F2B705"/>` +
-      `<rect x="${u(2.6)}" y="${u(-0.4)}" width="${u(10.8)}" height="${u(0.9)}" rx="${u(0.4)}" fill="#D99E00"/>`
-    )
-  }
-
-  if (seviye === 'kalfa') {
-    // Kulaklık.
-    return (
-      `<path d="M${u(3)} ${u(1.4)} Q${u(3)} ${u(-2.2)} ${u(8)} ${u(-2.2)} Q${u(13)} ${u(-2.2)} ${u(13)} ${u(1.4)}" fill="none" stroke="#3A3A3A" stroke-width="${u(0.55)}"/>` +
-      `<rect x="${u(1.5)}" y="${u(0.3)}" width="${u(1.7)}" height="${u(2.3)}" rx="${u(0.5)}" fill="#3A3A3A"/>` +
-      `<rect x="${u(12.8)}" y="${u(0.3)}" width="${u(1.7)}" height="${u(2.3)}" rx="${u(0.5)}" fill="#3A3A3A"/>`
-    )
-  }
-
-  // Pervaneli çırak şapkası.
-  return (
-    `<path d="M${u(5)} ${u(0.2)} Q${u(8)} ${u(-2.8)} ${u(11)} ${u(0.2)} Z" fill="#E4572E"/>` +
-    `<rect x="${u(7.8)}" y="${u(-2.6)}" width="${u(0.4)}" height="${u(1.2)}" fill="#3A3A3A"/>` +
-    `<ellipse cx="${u(8)}" cy="${u(-2.7)}" rx="${u(2.4)}" ry="${u(0.45)}" fill="#3A86FF">` +
-    `<animate attributeName="rx" values="${u(2.4)};${u(0.3)};${u(2.4)}" dur="0.5s" repeatCount="indefinite"/></ellipse>`
-  )
-}
-
-/** Feride'nin ekleri: topuz, gözlük, ruj, inci kolye, elinde pano. */
-function ferideSusu(s: number): string {
-  const u = (v: number): string => yuvarla(v * s)
-  const p: string[] = [
-    `<rect x="${u(1.8)}" y="${u(-0.9)}" width="${u(12.4)}" height="${u(1.7)}" rx="${u(0.8)}" fill="#4A2C2A"/>`,
-    `<circle cx="${u(8)}" cy="${u(-2.3)}" r="${u(1.9)}" fill="#4A2C2A"/>`,
-    `<path d="M${u(5.6)} ${u(-3.9)} L${u(10.4)} ${u(-0.9)}" stroke="#C9925F" stroke-width="${u(0.3)}" stroke-linecap="round"/>`,
-  ]
-
-  for (const gx of [3.5, 9.5]) {
-    p.push(
-      `<rect x="${u(gx)}" y="${u(1.4)}" width="${u(3)}" height="${u(3.2)}" rx="${u(0.9)}" fill="#FFFFFF" fill-opacity="0.3" stroke="#1F1F1F" stroke-width="${u(0.35)}"/>`,
-    )
-  }
-
-  p.push(
-    `<path d="M${u(6.5)} ${u(2.6)} L${u(9.5)} ${u(2.6)}" stroke="#1F1F1F" stroke-width="${u(0.35)}"/>`,
-    `<path d="M${u(7)} ${u(5.7)} Q${u(8)} ${u(6.5)} ${u(9)} ${u(5.7)}" fill="none" stroke="#C2185B" stroke-width="${u(0.45)}" stroke-linecap="round"/>`,
-  )
-
-  for (let i = 0; i <= 6; i += 1) {
-    p.push(`<circle cx="${u(5 + i)}" cy="${u(7.2 - Math.abs(3 - i) * 0.12)}" r="${u(0.36)}" fill="#FFFFFF" stroke="#D8CFC4" stroke-width="0.6"/>`)
-  }
-
-  p.push(
-    `<rect x="${u(-3.4)}" y="${u(1.2)}" width="${u(4)}" height="${u(5.2)}" rx="${u(0.3)}" fill="#F5E6C8" stroke="#8B5A3C" stroke-width="${u(0.3)}"/>`,
-    `<rect x="${u(-2.4)}" y="${u(0.7)}" width="${u(2)}" height="${u(0.9)}" rx="${u(0.3)}" fill="#8B5A3C"/>`,
-  )
-
-  for (let i = 0; i < 3; i += 1) {
-    p.push(`<path d="M${u(-2.8)} ${u(2.7 + i * 1.1)} L${u(-0.2)} ${u(2.7 + i * 1.1)}" stroke="#8B5A3C" stroke-width="${u(0.22)}"/>`)
-  }
-
-  return p.join('')
-}
-
-/** Konuşma balonu: alt ucu (cx, alt) noktasına iner, belirirken büyür. */
-function balon(cx: number, alt: number, satirlar: readonly string[]): string {
-  const boy = 10.5
-  const en = Math.max(46, Math.max(...satirlar.map(s => s.length)) * boy * 0.56 + 18)
-  const yukseklik = satirlar.length * 13 + 9
-  const sol = sinirla(cx - en / 2, 6, G - 6 - en) - cx
-  const yazilar = satirlar
-    .map(
-      (satir, i) =>
-        `<text x="${yuvarla(sol + en / 2)}" y="${yuvarla(-yukseklik + 15 + i * 13)}" font-size="${boy}" text-anchor="middle" fill="${KOYU}">${kacis(satir)}</text>`,
-    )
-    .join('')
+/** Patron bölümünün şablona göre değişen son paragrafı. */
+function sablonBolumu(sablon: Sablon): string {
+  const S = SABLON[sablon]
 
   return (
-    `<g transform="translate(${yuvarla(cx)} ${yuvarla(alt)})"><g>` +
-    '<animateTransform attributeName="transform" type="scale" values="0.3;1.08;1" dur="0.3s" fill="freeze"/>' +
-    `<rect x="${yuvarla(sol)}" y="${-yukseklik}" width="${yuvarla(en)}" height="${yukseklik}" rx="9" fill="#FFFFFF" stroke="${KOYU}" stroke-width="1.3"/>` +
-    '<path d="M-5 -0.6 L0 7 L5 -0.6" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="1.6"/>' +
-    `<path d="M-5 0 L0 7 L5 0" fill="none" stroke="${KOYU}" stroke-width="1.3" stroke-linejoin="round"/>` +
-    `${yazilar}</g></g>`
+    `## Geçerli şablon: ${S.ad}\n` +
+    `Bu şablon ${S.ozet}. Verilebilecek en yüksek seviye: ${SEVIYE_ADI[S.tavan]}. ` +
+    'Seviyeleri buna göre iste; şablonu kullanıcı `/feride şablon hafif|orta|güçlü` ile değiştirir.'
   )
-}
-
-function durumIsareti(durum: Durum, x: number, y: number): string {
-  const yer = `<g transform="translate(${yuvarla(x)} ${yuvarla(y)})">`
-
-  if (durum === 'calisiyor') {
-    return (
-      `${yer}<g><animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="3s" repeatCount="indefinite"/>` +
-      '<circle r="6.5" fill="none" stroke="#6B5B4D" stroke-width="4" stroke-dasharray="3.4 3.4"/>' +
-      '<circle r="4.4" fill="#6B5B4D"/><circle r="1.8" fill="#FFF4E6"/></g></g>'
-    )
-  }
-
-  if (durum === 'bekliyor') {
-    return (
-      yer +
-      [0, 1, 2]
-        .map(
-          i =>
-            `<text x="${i * 6}" y="${-i * 7}" font-size="${9 + i * 2}" font-weight="700" fill="#8A7A6C">z` +
-            `<animate attributeName="opacity" values="0;1;0" dur="3s" begin="-${i}s" repeatCount="indefinite"/></text>`,
-        )
-        .join('') +
-      '</g>'
-    )
-  }
-
-  if (durum === 'bitti') {
-    const konfeti = ['#F2B705', '#5B8DEF', '#58B368', '#E4572E', '#B56BD6']
-      .map(
-        (renk, i) =>
-          `<rect x="${-96 + i * 19}" y="-14" width="3.5" height="6" fill="${renk}">` +
-          `<animateTransform attributeName="transform" type="translate" values="0 -8;0 34" dur="1.5s" begin="-${yuvarla(i * 0.3)}s" repeatCount="indefinite"/>` +
-          `<animate attributeName="opacity" values="1;1;0" dur="1.5s" begin="-${yuvarla(i * 0.3)}s" repeatCount="indefinite"/></rect>`,
-      )
-      .join('')
-
-    return (
-      `${yer}${konfeti}<circle r="9" fill="#3FA34D"/>` +
-      '<path d="M-4.5 0 L-1.3 3.4 L4.8 -3.2" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></g>'
-    )
-  }
-
-  const duman = [0, 1, 2]
-    .map(
-      i =>
-        `<circle cx="${-52 + i * 5}" cy="-8" r="${4 + i}" fill="#9A9A9A">` +
-        `<animate attributeName="cy" values="-8;-34" dur="1.5s" begin="-${yuvarla(i * 0.5)}s" repeatCount="indefinite"/>` +
-        `<animate attributeName="opacity" values="0.75;0" dur="1.5s" begin="-${yuvarla(i * 0.5)}s" repeatCount="indefinite"/></circle>`,
-    )
-    .join('')
-
-  return (
-    `${yer}${duman}<circle r="9" fill="#D64545"/>` +
-    '<text y="4.5" font-size="13" font-weight="700" text-anchor="middle" fill="#FFFFFF">!</text></g>'
-  )
-}
-
-const G = 720
-const UST = 222
-const ADIM = 180
-/** SVG'nin kendi genişliği G'nin bu katı: yüzey kutuyu yuvaya sığdırdığından çizim alanı doldurur. */
-const SVG_BUYUTME = 2.5
-/** Masaüstünde bir hücrenin CSS pikseli cinsinden tahmini eni. */
-const PIKSEL_HUCRE = 7.5
-
-function uyeCiz(uye: Uye, cx: number, t: number, hucre: number, soz: string | undefined): string {
-  const s = 5
-  const p: string[] = ['<g>']
-  const ipucu = [
-    `${uye.ad}: ${uye.rol} (${uye.asama}. aşama)`,
-    uye.yetkinlikler.length > 0 ? `Yetkinlikler: ${uye.yetkinlikler.join(', ')}` : '',
-    `Model: ${SEVIYE_ADI[uye.seviye]}/${uye.model}, ${uye.gerekce}`,
-    `Görev: ${kisalt(temiz(uye.gorev), 220)}`,
-  ]
-    .filter(satir => satir !== '')
-    .join('\n')
-
-  p.push(`<title>${kacis(ipucu)}</title>`)
-  p.push(`<rect x="${yuvarla(cx - hucre / 2 + 8)}" y="${t + 124}" width="${yuvarla(hucre - 16)}" height="3" rx="1.5" fill="#E3CDB4"/>`)
-  p.push(clawd(cx - 8 * s, t + 64, s, uye.durum, sapka(uye.seviye, s)))
-
-  // Masa ve dizüstü maskotun önünde: bacakları örter.
-  p.push(
-    `<rect x="${cx - 17}" y="${t + 84}" width="34" height="19" rx="2.5" fill="#4A4A4A"/>`,
-    `<circle cx="${cx}" cy="${t + 93.5}" r="2.8" fill="${TURUNCU}">` +
-      (uye.durum === 'calisiyor' ? '<animate attributeName="opacity" values="0.3;1;0.3" dur="1s" repeatCount="indefinite"/>' : '') +
-      '</circle>',
-    `<rect x="${cx - 58}" y="${t + 102}" width="116" height="9" rx="2" fill="#B07B4F"/>`,
-    `<rect x="${cx - 52}" y="${t + 111}" width="104" height="13" fill="#C9925F"/>`,
-  )
-  p.push(durumIsareti(uye.durum, cx + 52, t + 72))
-
-  const rozet = ROZET[uye.seviye]
-  const inmis = uye.seviye !== uye.istenen
-
-  p.push(
-    `<text x="${cx}" y="${t + 141}" font-size="12.5" font-weight="700" text-anchor="middle" fill="#3B2F2F">${kacis(uye.ad)}</text>`,
-    `<text x="${cx}" y="${t + 154}" font-size="10" text-anchor="middle" fill="#7A6A5C">${kacis(kisalt(uye.rol, 26))}</text>`,
-    `<rect x="${cx - 50}" y="${t + 159}" width="100" height="15" rx="7.5" fill="${rozet.zemin}"/>`,
-    `<text x="${cx}" y="${t + 170}" font-size="9.5" font-weight="700" text-anchor="middle" fill="${rozet.yazi}">` +
-      `${inmis ? '↓ ' : ''}${SEVIYE_ADI[uye.seviye]} · ${kacis(kisalt(uye.model, 10))} · A${uye.asama}</text>`,
-  )
-
-  if (soz !== undefined && soz !== '') {
-    p.push(balon(cx, t + 41, sar(soz, 23, 3)))
-  } else if (uye.durum === 'calisiyor' && uye.sonIs !== undefined) {
-    const is = kisalt(uye.sonIs, 28)
-    const en = is.length * 5.5 + 18
-
-    p.push(
-      `<rect x="${yuvarla(cx - en / 2)}" y="${t + 22}" width="${yuvarla(en)}" height="17" rx="8.5" fill="#FFFFFF" fill-opacity="0.9" stroke="#C9B8A6"/>`,
-      `<text x="${cx}" y="${t + 34}" font-size="9" font-family="Consolas, Menlo, monospace" text-anchor="middle" fill="#6B5B4D">${kacis(is)}</text>`,
-      `<circle cx="${cx + 3}" cy="${t + 44}" r="2.2" fill="#FFFFFF" stroke="#C9B8A6"/>`,
-    )
-  }
-
-  p.push('</g>')
-
-  return p.join('')
-}
-
-function limitPanosu(limitler: readonly LimitOkuma[], is: Is | null): string {
-  const p: string[] = [
-    '<rect x="506" y="22" width="200" height="132" rx="8" fill="#2F3E46" stroke="#8B5A3C" stroke-width="4"/>',
-    '<text x="606" y="43" font-size="10.5" font-weight="700" letter-spacing="1.5" text-anchor="middle" fill="#F4F1DE">LİMİT PANOSU</text>',
-  ]
-
-  if (limitler.length === 0) {
-    p.push(
-      '<text x="606" y="82" font-size="10.5" text-anchor="middle" fill="#CFE8D5">Limit bilgisi yok</text>',
-      '<text x="606" y="98" font-size="9.5" text-anchor="middle" fill="#9DB5A6">(abonelik dışı oturum)</text>',
-    )
-  }
-
-  for (const [i, limit] of limitler.slice(0, 3).entries()) {
-    const y = 60 + i * 24
-    const renk = limit.yuzde < 60 ? '#58B368' : limit.yuzde < 85 ? '#F2B705' : '#E4572E'
-
-    p.push(
-      `<text x="518" y="${y + 8}" font-size="10" fill="#F4F1DE">${kacis(kisalt(limitAdi(limit.tur), 9))}</text>`,
-      `<rect x="574" y="${y}" width="86" height="9" rx="4.5" fill="#1B262B"/>`,
-      `<rect x="574" y="${y}" width="${yuvarla((86 * limit.yuzde) / 100)}" height="9" rx="4.5" fill="${renk}"/>`,
-      `<text x="698" y="${y + 8}" font-size="10" font-weight="700" text-anchor="end" fill="#F4F1DE">%${limit.yuzde}</text>`,
-    )
-  }
-
-  if (is !== null) {
-    p.push(`<text x="606" y="143" font-size="9.5" text-anchor="middle" fill="#CFE8D5">Bu işin tahmini payı ≈ %${sayi(is.tahmin)}</text>`)
-  }
-
-  return p.join('')
-}
-
-/**
- * Panonun boy/en oranı (hücre sayılarından; bir hücre aşağı yukarı enin iki katı boyundadır).
- * Ölçü bilinmiyorsa undefined: çizim kendi doğal oranıyla kalır. Yatık panoda oran küçük çıkar
- * ve çizim yine doğal boyunu korur (boy hiçbir zaman doğal boyun altına inmez).
- */
-function panoOrani(sutunlar: number | undefined, satirlar: number | undefined): number | undefined {
-  if (!sutunlar || !satirlar || sutunlar <= 0 || satirlar <= 0) return undefined
-  // Düğme satırı ve boşluk için birkaç satır düşülür.
-  const oran = (Math.max(1, satirlar - 3) * 2.1) / sutunlar
-
-  return Number.isFinite(oran) ? Math.min(oran, 3) : undefined
-}
-
-function ofisSvg(
-  is: Is | null,
-  limitler: readonly LimitOkuma[],
-  acik: boolean,
-  hedefOran?: number,
-): { kaynak: string; alt: string; oran: number } {
-  const uyeler = is?.uyeler ?? []
-  const n = uyeler.length
-  const hedefBoy = hedefOran === undefined ? 0 : Math.round(G * hedefOran)
-  // Uzun (dikey) panoda küçük ekip tek sütunda, daha iri çizilir; yoksa satır başına en çok iki üye.
-  const dikey = hedefBoy > G * 1.1
-  const sutun = n === 0 ? 3 : dikey && n <= 4 ? 1 : Math.min(n, 2)
-  const sira = n === 0 ? 1 : Math.ceil(n / sutun)
-  const hucre = (G - 28) / sutun
-  // Pano boyunu doldurmak için satır başına düşen yükseklik; Clawd'lar buna göre büyür.
-  const satirPayi = hedefBoy > 0 ? (hedefBoy - UST - 40) / sira : 0
-  const enCok = sutun === 1 ? 2.4 : 1.8
-  const buyutme = n === 0 ? 1 : Math.min(enCok, Math.max(1.5, satirPayi / ADIM))
-  const adim = Math.max(ADIM * buyutme, satirPayi)
-  // Üye, kendisine düşen satır payında dikeyde ortalanır.
-  const kaydir = Math.round((adim - ADIM * buyutme) / 2)
-  const dip = UST + sira * adim
-  const boy = Math.round(Math.max(dip + 40, hedefBoy))
-  const sh = is === null ? undefined : sahne(is)
-  const ferideSozu = sh?.feride ?? (acik ? FERIDE_BOS : FERIDE_KAPALI)
-  const suruyor = is?.durum === 'suruyor'
-  const p: string[] = [
-    // Kendi boyu geniş verilir: kutu "yuvaya kadar" genişlediği için çizim panonun ya da sohbetin
-    // tüm genişliğini doldurur, yüksekliği oranla büyür.
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${G} ${boy}" width="${yuvarla(G * SVG_BUYUTME)}" height="${yuvarla(boy * SVG_BUYUTME)}" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">`,
-    `<rect width="${G}" height="${boy}" rx="16" fill="#FFF4E6"/>`,
-    `<rect x="0" y="${boy - 30}" width="${G}" height="30" fill="#F3E3CF"/>`,
-  ]
-
-  // Feride: masasının arkasında, yanında kahvesi.
-  p.push(clawd(60, 62, 7, 'patron', ferideSusu(7), suruyor))
-  p.push(
-    '<rect x="36" y="122" width="200" height="12" rx="3" fill="#8B5A3C"/>',
-    '<rect x="44" y="134" width="184" height="42" fill="#A9714B"/>',
-    '<rect x="86" y="144" width="100" height="20" rx="3" fill="#F2D398" stroke="#8B5A3C"/>',
-    '<text x="136" y="158" font-size="10" font-weight="700" letter-spacing="0.8" text-anchor="middle" fill="#4A2C2A">PATRON FERİDE</text>',
-    '<rect x="196" y="106" width="15" height="16" rx="2" fill="#FFFFFF" stroke="#4A2C2A" stroke-width="1.2"/>',
-    '<path d="M211 110 Q218 114 211 118" fill="none" stroke="#4A2C2A" stroke-width="1.2"/>',
-  )
-
-  for (const i of [0, 1]) {
-    p.push(
-      `<path d="M${200 + i * 6} 102 q3 -5 0 -9 q-3 -4 0 -8" fill="none" stroke="#B9A999" stroke-width="1.4" stroke-linecap="round">` +
-        `<animate attributeName="opacity" values="0;0.9;0" dur="3s" begin="-${yuvarla(i * 1.5)}s" repeatCount="indefinite"/></path>`,
-    )
-  }
-
-  const satirlar = sar(ferideSozu, 36, 4)
-  const balonBoyu = Math.max(46, satirlar.length * 16 + 18)
-
-  p.push(
-    `<rect x="240" y="22" width="252" height="${balonBoyu}" rx="12" fill="#FFFFFF" stroke="${KOYU}" stroke-width="1.5"/>`,
-    '<path d="M241 38 L208 62 L241 54" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="2"/>',
-    `<path d="M240 38 L208 62 L240 54" fill="none" stroke="${KOYU}" stroke-width="1.5" stroke-linejoin="round"/>`,
-    ...satirlar.map(
-      (satir, i) => `<text x="254" y="${43 + i * 16}" font-size="12.5" fill="${KOYU}">${kacis(satir)}</text>`,
-    ),
-  )
-  p.push(limitPanosu(limitler, is))
-
-  // Şerit: iş ve aşamalar.
-  p.push(`<rect x="14" y="186" width="${G - 28}" height="24" rx="12" fill="${KOYU}"/>`)
-
-  if (is === null) {
-    p.push('<text x="30" y="202" font-size="11" fill="#FFFFFF">Yedek kulübesi: ekip iş bekliyor</text>')
-  } else {
-    const etiket = is.durum === 'tamam' ? 'Bitti' : `Aşama ${is.asama}/${is.asamaSayisi}`
-    const noktaSol = G - 30 - (is.asamaSayisi - 1) * 16
-
-    p.push(
-      `<text x="30" y="202" font-size="11" fill="#FFFFFF"><tspan font-weight="700">İŞ:</tspan> ${kacis(kisalt(is.ozet, 62))}</text>`,
-      `<text x="${noktaSol - 14}" y="202" font-size="10.5" font-weight="700" text-anchor="end" fill="#F2D398">${etiket}</text>`,
-    )
-
-    for (let a = 1; a <= is.asamaSayisi; a += 1) {
-      const bitmis = is.durum === 'tamam' || a < is.asama
-      const simdiki = !bitmis && a === is.asama
-
-      p.push(
-        `<circle cx="${noktaSol + (a - 1) * 16}" cy="198" r="5" fill="${bitmis ? '#58B368' : simdiki ? TURUNCU : '#6B6B6B'}">` +
-          (simdiki ? '<animate attributeName="r" values="4;6;4" dur="1s" repeatCount="indefinite"/>' : '') +
-          '</circle>',
-      )
-    }
-  }
-
-  if (n === 0) {
-    // Boş ofis de uzun panoda dikeyde ortalanır.
-    p.push(`<g transform="translate(0 ${kaydir})">`)
-
-    for (let i = 0; i < 3; i += 1) {
-      const cx = 14 + hucre * (i + 0.5)
-
-      p.push(
-        `<rect x="${yuvarla(cx - hucre / 2 + 8)}" y="${UST + 124}" width="${yuvarla(hucre - 16)}" height="3" rx="1.5" fill="#E3CDB4"/>`,
-        clawd(cx - 40, UST + 64, 5, 'uyku', ''),
-        durumIsareti('bekliyor', cx + 52, UST + 72),
-        `<text x="${yuvarla(cx)}" y="${UST + 141}" font-size="12" font-weight="700" text-anchor="middle" fill="#3B2F2F">Clawd ${i + 1}</text>`,
-        `<text x="${yuvarla(cx)}" y="${UST + 154}" font-size="10" text-anchor="middle" fill="#7A6A5C">sırasını bekliyor</text>`,
-      )
-    }
-
-    p.push('</g>')
-  }
-
-  for (const [i, uye] of uyeler.entries()) {
-    const satir = Math.floor(i / sutun)
-    const satirdaki = Math.min(sutun, n - satir * sutun)
-    const cx = Math.round(14 + ((sutun - satirdaki) * hucre) / 2 + hucre * ((i % sutun) + 0.5))
-    const t = Math.round(UST + satir * adim + kaydir)
-
-    p.push(
-      `<g transform="translate(${cx} ${t}) scale(${buyutme}) translate(${-cx} ${-t})">`,
-      uyeCiz(uye, cx, t, hucre / buyutme, sh?.sozler.get(uye.id)),
-      '</g>',
-    )
-  }
-
-  const dipnot = is === null ? 'Model seçimi: usta → opus, kalfa → sonnet, çırak → haiku; kalan limite göre Feride karar verir.' : is.limitNotu
-
-  for (const [i, satir] of sar(dipnot, 118, 2).entries()) {
-    p.push(`<text x="20" y="${dip + 8 + i * 13}" font-size="10" font-style="italic" fill="#6B5B4D">${kacis(satir)}</text>`)
-  }
-
-  p.push('</svg>')
-
-  const durumlar = uyeler.map(u => `${u.ad} (${u.rol}, ${SEVIYE_ADI[u.seviye]}): ${DURUM_ADI[u.durum]}`).join('; ')
-
-  return {
-    kaynak: p.join(''),
-    oran: boy / G,
-    alt: is === null ? `Feride'nin ofisi. Feride: ${ferideSozu}` : `Feride'nin ofisi. İş: ${is.ozet}. ${durumlar}. Feride: ${ferideSozu}`,
-  }
-}
-
-const DURUM_ADI: Record<Durum, string> = {
-  bekliyor: 'sırasını bekliyor',
-  calisiyor: 'çalışıyor',
-  bitti: 'bitirdi',
-  hata: 'takıldı',
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,8 +286,13 @@ const DURUM_ADI: Record<Durum, string> = {
 // Modülün kendi değişkenleri: yeniden yüklemede sıfırlanır, session.start kurar.
 let isciTuru = 'general-purpose'
 let saat: Timer | undefined
-const sonIsler = new Map<string, string>()
+const sonIsler = new Map<string, { metin: string; etkinlik: Etkinlik }>()
 const supheler = new Map<string, number>()
+/** Feride'nin modeli değiştirilince üst üste yanıtsız kalan adım sayısı: ikide vazgeçilir. */
+let patronHatasi = 0
+let vurusSayisi = 0
+/** Üyenin canlandırmasının en son değiştiği an. */
+const etkinlikZamani = new Map<string, number>()
 
 type Hamle = { ne: 'asama'; asama: number } | { ne: 'son' } | undefined
 
@@ -1266,24 +454,31 @@ async function uyeBitti($: EngineInterface, agentId: string, cevap: string, nede
     uyeler: eski.uyeler.map((u): Uye => {
       if (u.agentId !== agentId || u.durum !== 'calisiyor') return u
 
-      const { sonIs: _sonIs, ...kalan } = u
+      const { sonIs: _sonIs, etkinlik: _etkinlik, ...kalan } = u
 
       return { ...kalan, durum: basarili ? 'bitti' : 'hata', rapor, bitti: simdi, ...(laf === undefined ? {} : { laf }) }
     }),
   }))
 }
 
-/** Saatin vuruşu: kareyi ilerletir, son işleri panoya yazar, ölen ajanı düşürür. */
+/**
+ * Saatin vuruşu: ölen ajanı hemen düşürür; panoya yazılanları (son işler, kare sayacı)
+ * her üç vuruşta bir günceller. Pano her yazımda yeniden çizildiği için seyrek yazılır:
+ * canlandırmalar kesilmez, bilgi birkaç saniye geriden gelir.
+ */
 async function vurus($: EngineInterface): Promise<void> {
   const is = await read($, isAtom)
 
   if (is === null || is.durum !== 'suruyor') return
 
+  vurusSayisi += 1
+
   const simdi = await $.clock.now()
   const dusen = new Map<string, string>()
+  const panoZamani = vurusSayisi % PANO_VURUSU === 0
   let durumlar: Map<string, string> | undefined
 
-  if (is.tik % 2 === 1) {
+  if (vurusSayisi % 2 === 0) {
     try {
       durumlar = new Map((await $.agent.list()).map(a => [a.id, a.status]))
     } catch {
@@ -1319,6 +514,8 @@ async function vurus($: EngineInterface): Promise<void> {
     }
   }
 
+  if (dusen.size === 0 && !panoZamani) return
+
   const isler = new Map(sonIsler)
 
   await ilerlet($, eski =>
@@ -1326,7 +523,7 @@ async function vurus($: EngineInterface): Promise<void> {
       ? eski
       : {
           ...eski,
-          tik: eski.tik + 1,
+          tik: panoZamani ? eski.tik + 1 : eski.tik,
           uyeler: eski.uyeler.map((u): Uye => {
             if (u.durum !== 'calisiyor') return u
 
@@ -1334,9 +531,17 @@ async function vurus($: EngineInterface): Promise<void> {
 
             if (neden !== undefined) return { ...u, durum: 'hata', rapor: neden, bitti: simdi }
 
-            const sonIs = u.agentId === undefined ? undefined : isler.get(u.agentId)
+            const son = u.agentId === undefined || !panoZamani ? undefined : isler.get(u.agentId)
 
-            return sonIs === undefined || sonIs === u.sonIs ? u : { ...u, sonIs }
+            if (son === undefined) return u
+
+            // Canlandırma en çok ETKINLIK_ARASI'nda bir değişir: her araç çağrısında kartı baştan çizmez.
+            const degisir = son.etkinlik !== u.etkinlik && simdi - (etkinlikZamani.get(u.id) ?? 0) >= ETKINLIK_ARASI
+
+            if (degisir) etkinlikZamani.set(u.id, simdi)
+            if (son.metin === u.sonIs && !degisir) return u
+
+            return { ...u, sonIs: son.metin, ...(degisir ? { etkinlik: son.etkinlik } : {}) }
           }),
         },
   )
@@ -1350,8 +555,21 @@ async function isiSil($: EngineInterface): Promise<void> {
 }
 
 async function modAyarla($: EngineInterface, acik: boolean): Promise<void> {
+  if (acik) patronHatasi = 0
   await update($, acikAtom, () => acik)
   await $.store.set('acik', acik)
+}
+
+async function sablonAyarla($: EngineInterface, sablon: Sablon): Promise<void> {
+  await update($, sablonAtom, () => sablon)
+  await $.store.set('sablon', sablon)
+}
+
+/** Feride'nin şu an çalışacağı model: mod kapalıyken ya da vazgeçilmişse oturumun kendi modeli. */
+async function patronDurumu($: EngineInterface): Promise<{ model: string; neden: string }> {
+  if (patronHatasi >= 2) return { model: 'oturumun modeli', neden: 'en üst model bu oturumda yanıt vermedi' }
+
+  return patronModeli(await read($, limitAtom))
 }
 
 async function panoAc($: EngineInterface): Promise<string> {
@@ -1364,8 +582,19 @@ async function panoAc($: EngineInterface): Promise<string> {
   }
 }
 
-function durumMetni(is: Is | null, limitler: readonly LimitOkuma[], acik: boolean, simdi: number): string {
-  const satirlar = [`Feride modu: ${acik ? 'açık' : 'kapalı'}`]
+function durumMetni(
+  is: Is | null,
+  limitler: readonly LimitOkuma[],
+  acik: boolean,
+  simdi: number,
+  sablon: Sablon,
+  patron: { model: string; neden: string },
+): string {
+  const satirlar = [
+    `Feride modu: ${acik ? 'açık' : 'kapalı'}`,
+    `Şablon: ${SABLON[sablon].ad} (${SABLON[sablon].ozet})`,
+    `Feride'nin modeli: ${patron.model} (${patron.neden})`,
+  ]
 
   if (is === null) satirlar.push('Süren iş yok.')
   else {
@@ -1430,16 +659,23 @@ export const register: Register = on => {
 
     if (kayitli === false) await update($, acikAtom, () => false)
 
+    const kayitliSablon = sablonOku(await $.store.get('sablon')) ?? 'orta'
+
+    await update($, sablonAtom, () => kayitliSablon)
+    patronHatasi = 0
+    vurusSayisi = 0
+    etkinlikZamani.clear()
+
     await $.command.register({
       name: 'feride',
       description: "Patron Feride'nin ofisini aç ya da ona iş ver",
-      argumentHint: '[iş tanımı | aç | kapat | durum | sıfırla]',
+      argumentHint: '[iş tanımı | aç | kapat | durum | sıfırla | şablon hafif|orta|güçlü]',
     })
     await $.tool.register({
       name: 'ekip_kur',
       description:
         'Feride modunun ekip kurma aracı: patron Feride (ana oturum) işi görevlere böler, üyeleri ve yetkinliklerini yazar; ' +
-        'araç kalan kullanım limitine göre her üyenin modelini seçer, üyeleri arka planda başlatır ve hemen döner. ' +
+        'araç geçerli şablona ve kalan kullanım limitine göre her üyenin modelini seçer, üyeleri arka planda başlatır ve hemen döner. ' +
         'Raporlar sonradan tek mesajla gelir. Yalnızca sistem isteminde Feride modu bölümü varken kullan.',
       inputSchema: {
         type: 'object',
@@ -1457,8 +693,14 @@ export const register: Register = on => {
                 yetkinlikler: { type: 'array', items: { type: 'string' }, description: '2-4 yetkinlik.' },
                 seviye: {
                   type: 'string',
-                  enum: ['usta', 'kalfa', 'çırak'],
-                  description: 'usta: en güçlü model; kalfa: dengeli; çırak: hızlı ve ucuz.',
+                  enum: ['üstat', 'usta', 'kalfa', 'çırak'],
+                  description:
+                    'üstat: en üst model, yalnızca gerçekten gerektiren zor iş için (düz metne verilmez); usta: güçlü; kalfa: dengeli; çırak: hızlı ve ucuz.',
+                },
+                tur: {
+                  type: 'string',
+                  enum: ['metin', 'kod', 'arastirma', 'inceleme'],
+                  description: 'İşin türü. metin: düz metin yazma, özet, çeviri, belge; inceleme: kod incelemesi, test, doğrulama.',
                 },
                 asama: { type: 'integer', minimum: 1, description: 'Aynı numara paralel çalışır; sonraki öncekinin raporlarını alır.' },
                 gorev: { type: 'string', description: 'Tek başına anlaşılır görev metni: yollar, kısıtlar, beklenen çıktı.' },
@@ -1471,6 +713,11 @@ export const register: Register = on => {
             type: 'array',
             items: { type: 'string' },
             description: 'Bu işe özel 4-8 kısa esprili söz, "Ad: söz" biçiminde.',
+          },
+          sablon: {
+            type: 'string',
+            enum: ['hafif', 'orta', 'güçlü'],
+            description: 'Yalnızca kullanıcı bu iş için açıkça başka bir şablon istediyse; yoksa boş bırak.',
           },
         },
         required: ['ozet', 'ekip'],
@@ -1529,7 +776,31 @@ export const register: Register = on => {
     if (!e.tools.includes(ARAC) || e.traits.includes('teammate')) return istem
     if (!(await read($, acikAtom))) return istem
 
-    return { ...istem, sections: [...istem.sections, { id: 'feride:patron', text: PATRON_BOLUMU, scope: 'session' }] }
+    const text = `${PATRON_BOLUMU}\n\n${sablonBolumu(await read($, sablonAtom))}`
+
+    return { ...istem, sections: [...istem.sections, { id: 'feride:patron', text, scope: 'session' }] }
+  })
+
+  // Feride (ana döngü) hep en üst modelde çalışır; bir limit dolmak üzereyken bir alttakine iner.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined || patronHatasi >= 2 || !(await read($, acikAtom))) return yield* next(e)
+
+    const { model } = patronModeli(await read($, limitAtom))
+
+    // Oturum zaten o modeldeyse (geniş bağlamlı türü de olabilir) dokunulmaz.
+    if (e.model.toLowerCase().includes(model)) return yield* next(e)
+
+    const sonuc = yield* next({ ...e, model })
+
+    if (sonuc.stopReason === null && sonuc.usage === null) {
+      // Model bu hesapta yoksa oturum kilitlenmesin: iki yanıtsız adımdan sonra vazgeçilir.
+      patronHatasi += 1
+      if (patronHatasi >= 2) $.ui.toast(`Feride: ${model} yanıt vermedi; oturumun kendi modeliyle devam ediyorum.`, { timeoutMs: 8_000 })
+    } else {
+      patronHatasi = 0
+    }
+
+    return sonuc
   })
 
   on('command.run', { command: 'feride' }, async ($, e) => {
@@ -1551,8 +822,36 @@ export const register: Register = on => {
 
     if (anahtar === 'durum') {
       return {
-        text: durumMetni(await read($, isAtom), await read($, limitAtom), await read($, acikAtom), await $.clock.now()),
+        text: durumMetni(
+          await read($, isAtom),
+          await read($, limitAtom),
+          await read($, acikAtom),
+          await $.clock.now(),
+          await read($, sablonAtom),
+          await patronDurumu($),
+        ),
       }
+    }
+
+    // "/feride şablon güçlü" ya da kısaca "/feride güçlü": ekibin model cömertliği.
+    const sablonKomutu = /^(?:şablon|sablon)(?:\s+(.+))?$/.exec(anahtar)
+    const secilen = sablonKomutu === null ? sablonOku(anahtar) : sablonOku(sablonKomutu[1])
+
+    if (sablonKomutu !== null && secilen === undefined) {
+      const simdiki = await read($, sablonAtom)
+      const liste = SABLON_SIRASI.map(s => `- ${SABLON[s].ad}${s === simdiki ? ' (geçerli)' : ''}: ${SABLON[s].ozet}`).join('\n')
+
+      return {
+        text:
+          (sablonKomutu[1] === undefined ? '' : `"${sablonKomutu[1]}" diye bir şablon yok. `) +
+          `Şablonlar:\n${liste}\nDeğiştirmek için: /feride şablon hafif|orta|güçlü`,
+      }
+    }
+
+    if (secilen !== undefined) {
+      await sablonAyarla($, secilen)
+
+      return { text: `Şablon: ${SABLON[secilen].ad}. Bu şablon ${SABLON[secilen].ozet}. Sonraki ekipte geçerli.` }
     }
 
     if (anahtar === 'sıfırla' || anahtar === 'sifirla') {
@@ -1610,11 +909,13 @@ export const register: Register = on => {
       $.ui.log(`feride: limitler okunamadı: ${String(hata)}`, { to: 'debug' })
     }
 
-    const atama = modelSec(plan.taslaklar, limitler, simdi, await katsayiOku($))
+    const sablon = plan.sablon ?? (await read($, sablonAtom))
+    const atama = modelSec(plan.taslaklar, limitler, simdi, await katsayiOku($), sablon)
     const yeni: Is = {
       id: `is-${simdi.toString(36)}`,
       ...(e.tool_use_id === '' ? {} : { cagri: e.tool_use_id }),
       ozet: plan.ozet,
+      sablon,
       asama: 1,
       asamaSayisi: Math.max(...plan.taslaklar.map(t => t.asama)),
       uyeler: plan.taslaklar.map((t, i): Uye => {
@@ -1632,6 +933,7 @@ export const register: Register = on => {
           asama: t.asama,
           gorev: t.gorev,
           kritik: t.kritik,
+          isTuru: t.isTuru,
           durum: t.asama === 1 ? 'calisiyor' : 'bekliyor',
           ...(t.asama === 1 ? { basladi: simdi } : {}),
         }
@@ -1657,11 +959,11 @@ export const register: Register = on => {
     return { result: ekipMetni((await read($, isAtom)) ?? yeni) }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'feride: ekip kurulurken beklenmeyen bir hata oldu.' }))
 
-  // İşçilerin araç çağrıları panoda düşünce balonu olur.
+  // İşçilerin araç çağrıları kartlarına yansır: ne yaptığı yazıyla, nasıl yaptığı canlandırmayla.
   on('tool.call', ($, e, next) => {
     if (e.agentId !== undefined) {
       if (sonIsler.size > 64) sonIsler.clear()
-      sonIsler.set(e.agentId, isOzeti(e))
+      sonIsler.set(e.agentId, { metin: isOzeti(e), etkinlik: etkinlikBul(e.tool) })
     }
 
     return next(e)
@@ -1679,27 +981,28 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => ofisCiz($, e, e.props.bodyColumns, e.props.scroll?.bodyRows ?? e.viewport?.rows, true))
+  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => ofisCiz($, e, e.props.bodyColumns, e.props.scroll?.bodyRows ?? e.viewport?.rows))
 
   // Sahne yalnızca yan panoda çizilir; sohbetteki ekip_kur satırı aracın kendi satırı olarak kalır.
 }
 
-/** Ofis sahnesi: masaüstünde animasyonlu SVG, terminalde Clawd karakterleriyle. */
-async function ofisCiz(
-  $: EngineInterface,
-  e: ResolveInput,
-  genislik: number,
-  satirlar: number | undefined,
-  pano = false,
-): Promise<RenderElement> {
+/**
+ * Ofis panosu. Masaüstünde üstte sahne (Feride ve ortada dolaşan ekip), altında her üyenin
+ * kendi kartı: ayrı SVG'ler, her biri panonun enini doldurur. Terminalde Clawd karakterleriyle.
+ */
+async function ofisCiz($: EngineInterface, e: ResolveInput, genislik: number, satirlar: number | undefined): Promise<RenderElement> {
     const tablo = $.ui.resolve(e)
     const { Box, Text, Button } = tablo
     const is = await read($, isAtom)
     const limitler = await read($, limitAtom)
     const acik = await read($, acikAtom)
+    const sablon = await read($, sablonAtom)
+    const patron = acik ? await patronDurumu($) : { model: 'oturumun modeli', neden: 'mod kapalı' }
+    const sonrakiSablon = SABLON_SIRASI[(SABLON_SIRASI.indexOf(sablon) + 1) % SABLON_SIRASI.length] ?? 'orta'
     const dugmeler = (
       <Box flexDirection="row" gap={1}>
         <Button key="mod" label={acik ? 'Modu kapat' : 'Modu aç'} onPress={() => modAyarla($, !acik)} />
+        <Button key="sablon" label={`Şablon: ${SABLON[sablon].ad}`} onPress={() => sablonAyarla($, sonrakiSablon)} />
         {is !== null && is.durum === 'tamam' && (
           <Button key="temizle" label="Panoyu temizle" onPress={() => isiSil($)} />
         )}
@@ -1708,14 +1011,39 @@ async function ofisCiz(
 
     if (e.surface !== 'terminal' && 'Svg' in tablo) {
       const { Svg } = tablo
-      const cizim = ofisSvg(is, limitler, acik, pano ? panoOrani(genislik, satirlar) : undefined)
+      // Masaüstü boyu verilmemiş SVG'yi kısa bir kutuya sığdırıyor: en ve boy açıkça,
+      // CSS pikseli olarak verilir (bir hücre ≈ PIKSEL_HUCRE piksel).
       const en = Math.max(240, Math.round(genislik * PIKSEL_HUCRE))
+      // Bina kendi içinde dönen tek bir canlandırmadır: kaynağı yalnızca işin durumu değişince değişir.
+      const ofis = sahneSvg(is, limitler, acik, sablon, patron.model)
+      const uyeler = is?.uyeler ?? []
+      const calisanlar = uyeler.filter(uye => uye.durum === 'calisiyor' && uye.sonIs !== undefined)
 
       return (
-        <Box flexDirection="column" gap={1} width="100%" flexGrow={1}>
-          {/* Masaüstü boyu verilmemiş SVG'yi kısa bir kutuya sığdırıyor: en ve boy açıkça,
-              CSS pikseli olarak verilir (bir hücre ≈ PIKSEL_HUCRE piksel). */}
-          <Svg source={cizim.kaynak} alt={cizim.alt} width={en} height={Math.round(en * cizim.oran)} isInteractive />
+        <Box flexDirection="column" gap={1} width="100%">
+          <Box key="bina">
+            <Svg source={ofis.kaynak} alt={ofis.alt} width={en} height={Math.round(en * ofis.oran)} isInteractive />
+          </Box>
+          {/* Kartın kaynağı yalnızca o üyenin durumu ya da yaptığı işin türü değişince değişir. */}
+          {uyeler.map(uye => {
+            const kart = kartSvg(uye)
+
+            return (
+              <Box key={`kart:${uye.id}`}>
+                <Svg source={kart.kaynak} alt={kart.alt} width={en} height={Math.round(en * kart.oran)} isInteractive />
+              </Box>
+            )
+          })}
+          {/* Anlık ayrıntı yazıyla akar: çizimler baştan yüklenmez. */}
+          {calisanlar.length > 0 && (
+            <Box key="akis" flexDirection="column">
+              {calisanlar.map(uye => (
+                <Text dimColor>
+                  {uye.ad} › {uye.sonIs}
+                </Text>
+              ))}
+            </Box>
+          )}
           {dugmeler}
         </Box>
       )
@@ -1760,6 +1088,9 @@ async function ofisCiz(
               {limitler.length === 0
                 ? 'Limit: bilgi yok'
                 : limitler.map(l => `${limitAdi(l.tur)} ${cubuk(l.yuzde)} %${l.yuzde}`).join('  ')}
+            </Text>
+            <Text key="sablon" dimColor>
+              Şablon: {SABLON[sablon].ad} · Feride: {patron.model}
             </Text>
           </Box>
         </Box>

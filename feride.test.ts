@@ -25,7 +25,19 @@ function ofis(on: On, limitler: Limit[] = [], depo: Record<string, unknown> = {}
     saat: mock.clock(on, { now: SIMDI }),
     /** Doluysa her ajan başlatma bu nedenle reddedilir (örn. izin sınıflandırıcısı). */
     reddet: undefined as string | undefined,
+    /** Ana döngünün ve ajanların model adımlarında motora ulaşan model adları. */
+    adimlar: [] as string[],
+    /** true iken model adımları yanıtsız kalır (model bu hesapta yokmuş gibi). */
+    yanitsiz: false,
   }
+
+  on('turn.step', async function* (_, e) {
+    kayit.adimlar.push(e.model)
+
+    return { turnId: e.turnId, index: e.index, answer: 'tamam', toolUses: [], stopReason: kayit.yanitsiz ? null : 'end_turn', usage: null } as never
+  })
+  // İşçilerin kendi araç çağrıları (Grep, Edit...): motor yerine boş sonuç.
+  on('tool.call', () => ({ result: {} }) as never)
 
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: SIMDI, context: { window: 200_000 }, rateLimits: kayit.limitler } }))
@@ -91,7 +103,7 @@ const PANO = {
   view: {},
 } as const
 
-const uye = (ad: string, seviye: string, asama = 1, kritik = false) => ({
+const uye = (ad: string, seviye: string, asama = 1, kritik = false, tur?: string) => ({
   ad,
   rol: `${ad} rolü`,
   yetkinlikler: ['okuma', 'yazma'],
@@ -99,7 +111,15 @@ const uye = (ad: string, seviye: string, asama = 1, kritik = false) => ({
   asama,
   gorev: `${ad} kendi parçasını yapsın.`,
   kritik,
+  ...(tur === undefined ? {} : { tur }),
 })
+
+const ADIM = { turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 3 } as const
+
+/** Bir model adımını baştan sona yürütür. */
+async function adim($: { turn: { step: (e: never) => AsyncIterable<unknown> } }, e: object): Promise<void> {
+  for await (const _ of $.turn.step(e as never)) void _
+}
 
 /** Modun reddettiği araç çağrısının nedeni. */
 const red = (sonuc: unknown): string | undefined => (sonuc as { deny?: string }).deny
@@ -185,6 +205,140 @@ describe('modeller kalan limite göre seçilir', () => {
     await $.tool.call({ tool: ARAC, tool_use_id: 'k1', ozet: 'İş', ekip: [uye('Aras', 'usta'), uye('Bora', 'usta')] })
 
     expect(o.ajanlar.map(a => a.model)).toEqual(['opus', 'opus'])
+  })
+})
+
+describe('şablonlar', () => {
+  const BOL = [
+    { kind: 'five_hour', percentUsed: 10, resetsAt: SIFIRLANMA },
+    { kind: 'seven_day', percentUsed: 10 },
+  ]
+
+  test('güçlü şablonda zor işe en üst model verilir; düz metne ve türü belirsiz işe verilmez', async ($, on) => {
+    const o = ofis(on, BOL, { sablon: 'guclu' })
+
+    await $.session.start(OTURUM)
+
+    const sonuc = await $.tool.call({
+      tool: ARAC,
+      tool_use_id: 'k1',
+      ozet: 'Zor iş',
+      ekip: [
+        uye('Aras', 'üstat', 1, false, 'kod'),
+        uye('Bora', 'üstat', 1, false, 'metin'),
+        uye('Cem', 'üstat'),
+        uye('Derin', 'kalfa', 1, false, 'metin'),
+      ],
+    })
+
+    expect(o.ajanlar.map(a => a.model)).toEqual(['fable', 'opus', 'opus', 'sonnet'])
+    expect(JSON.stringify(sonuc)).toEqual(expect.stringContaining('düz metin işine en üst model verilmez'))
+    expect(JSON.stringify(sonuc)).toEqual(expect.stringContaining('Şablon: güçlü'))
+  })
+
+  test('orta şablonun tavanı usta, hafif şablonun tavanı kalfadır', async ($, on) => {
+    const o = ofis(on, BOL)
+
+    await $.session.start(OTURUM)
+    await $.tool.call({ tool: ARAC, tool_use_id: 'k1', ozet: 'Orta iş', ekip: [uye('Aras', 'üstat', 1, false, 'kod'), uye('Bora', 'çırak')] })
+    expect(o.ajanlar.map(a => a.model)).toEqual(['opus', 'haiku'])
+
+    await $.turn.complete(bitir('a1', 'ÖZET: tamam.'))
+    await $.turn.complete(bitir('a2', 'ÖZET: tamam.'))
+
+    const yanit = await $.command.run({ ...KOMUT, args: 'şablon hafif' })
+
+    expect(yanit.text).toEqual(expect.stringContaining('Şablon: hafif'))
+    expect((await $.command.run({ ...KOMUT, args: 'durum' })).text).toEqual(expect.stringContaining('Şablon: hafif'))
+
+    await $.tool.call({ tool: ARAC, tool_use_id: 'k2', ozet: 'Hafif iş', ekip: [uye('Cem', 'usta', 1, true, 'kod'), uye('Derin', 'kalfa'), uye('Ece', 'çırak')] })
+    expect(o.ajanlar.slice(2).map(a => a.model)).toEqual(['sonnet', 'sonnet', 'haiku'])
+  })
+
+  test('güçlü şablon limiti riske atar: ortanın kalfaya indirdiği yerde ustayı korur', async ($, on) => {
+    const dar = [{ kind: 'five_hour', percentUsed: 80, resetsAt: SIFIRLANMA }]
+    const ekip = [uye('Aras', 'usta', 1, false, 'kod'), uye('Bora', 'usta', 1, true, 'kod'), uye('Cem', 'kalfa')]
+    const o = ofis(on, dar)
+
+    await $.session.start(OTURUM)
+    await $.tool.call({ tool: ARAC, tool_use_id: 'k1', ozet: 'Orta', ekip })
+    expect(o.ajanlar.map(a => a.model)).toEqual(['sonnet', 'sonnet', 'sonnet'])
+
+    for (const id of ['a1', 'a2', 'a3']) await $.turn.complete(bitir(id, 'ÖZET: tamam.'))
+
+    // Bu işe özel şablon: kullanıcı açıkça istediyse Feride araca yazar.
+    await $.tool.call({ tool: ARAC, tool_use_id: 'k2', ozet: 'Güçlü', ekip, sablon: 'güçlü' })
+    expect(o.ajanlar.slice(3).map(a => a.model)).toEqual(['sonnet', 'opus', 'sonnet'])
+    // Kalıcı şablon değişmedi.
+    expect((await $.command.run({ ...KOMUT, args: 'durum' })).text).toEqual(expect.stringContaining('Şablon: orta'))
+  })
+
+  test('/feride şablon geçerli şablonu ve seçenekleri gösterir', async ($, on) => {
+    ofis(on)
+    await $.session.start(OTURUM)
+
+    const liste = await $.command.run({ ...KOMUT, args: 'şablon' })
+
+    expect(liste.text).toEqual(expect.stringContaining('orta (geçerli)'))
+    expect(liste.text).toEqual(expect.stringContaining('güçlü'))
+    expect((await $.command.run({ ...KOMUT, args: 'şablon turbo' })).text).toEqual(expect.stringContaining('"turbo" diye bir şablon yok'))
+
+    await $.command.run({ ...KOMUT, args: 'güçlü' })
+    expect((await $.command.run({ ...KOMUT, args: 'şablon' })).text).toEqual(expect.stringContaining('güçlü (geçerli)'))
+    // Patron bölümü geçerli şablonu Feride'ye söyler.
+    expect((await $.prompt.compose({ ...ISTEM, tools: [ARAC] })).sections.at(-1)?.text).toEqual(expect.stringContaining('Geçerli şablon: güçlü'))
+  })
+})
+
+describe('Feride’nin modeli', () => {
+  test('ana döngü en üst modelde çalışır; ajanların adımlarına dokunulmaz', async ($, on) => {
+    const o = ofis(on, [{ kind: 'five_hour', percentUsed: 50, resetsAt: SIFIRLANMA }])
+
+    await $.session.start(OTURUM)
+    await adim($, ADIM)
+    await adim($, { ...ADIM, agentId: 'a1' })
+    // Oturum zaten o modelin bir türündeyse adı korunur.
+    await adim($, { ...ADIM, model: 'claude-fable-5-2[1m]' })
+
+    expect(o.adimlar).toEqual(['fable', 'claude-sonnet-5-5', 'claude-fable-5-2[1m]'])
+    expect((await $.command.run({ ...KOMUT, args: 'durum' })).text).toEqual(expect.stringContaining("Feride'nin modeli: fable"))
+  })
+
+  test('bir limit %99’a varınca bir alttaki modele iner', async ($, on) => {
+    const o = ofis(on, [
+      { kind: 'five_hour', percentUsed: 40, resetsAt: SIFIRLANMA },
+      { kind: 'seven_day', percentUsed: 99 },
+    ])
+
+    await $.session.start(OTURUM)
+    await adim($, ADIM)
+
+    expect(o.adimlar).toEqual(['opus'])
+    expect((await $.command.run({ ...KOMUT, args: 'durum' })).text).toEqual(expect.stringContaining("Feride'nin modeli: opus (7 gün limiti %99 dolu"))
+  })
+
+  test('mod kapalıyken oturumun modeli olduğu gibi kalır', async ($, on) => {
+    const o = ofis(on)
+
+    await $.session.start(OTURUM)
+    await $.command.run({ ...KOMUT, args: 'kapat' })
+    await adim($, ADIM)
+
+    expect(o.adimlar).toEqual(['claude-sonnet-5-5'])
+  })
+
+  test('en üst model yanıt vermiyorsa iki denemeden sonra oturumun modeline dönülür', async ($, on) => {
+    const o = ofis(on)
+
+    await $.session.start(OTURUM)
+    o.yanitsiz = true
+    await adim($, ADIM)
+    await adim($, ADIM)
+    o.yanitsiz = false
+    await adim($, ADIM)
+
+    expect(o.adimlar).toEqual(['fable', 'fable', 'claude-sonnet-5-5'])
+    expect(o.bildirimler.at(-1)).toEqual(expect.stringContaining('oturumun kendi modeliyle'))
   })
 })
 
@@ -409,6 +563,47 @@ describe('ofis panosu', () => {
     await ui.unmount()
   })
 
+  test('departmanlar kat kat dizilir; başka kattakinin yanına asansörle gidilir', async ($, on) => {
+    const o = ofis(on)
+
+    await $.session.start(OTURUM)
+    await $.tool.call({
+      tool: ARAC,
+      tool_use_id: 'k1',
+      ozet: 'Katlı iş',
+      ekip: [uye('Aras', 'kalfa', 1, false, 'kod'), uye('Bora', 'kalfa', 1, false, 'metin'), uye('Cem', 'çırak', 1, false, 'kod')],
+    })
+
+    const ui = await $.ui.mount({ plugin: 'feride', surface: 'desktop', component: 'Pane', props: PANO, requestId: PANE })
+    const bina = async (): Promise<string> => String((await ui.findAll({ type: 'Svg' }))[0]?.props.source)
+    const ilk = await bina()
+
+    // Yönetim en üstte, her iş türü kendi katında, yanda asansör.
+    for (const tabela of ['3. KAT · YÖNETİM', '2. KAT · YAZILIM', '1. KAT · METİN YAZARLIĞI', 'ASANSÖR']) {
+      expect(ilk).toEqual(expect.stringContaining(tabela))
+    }
+
+    // İş yeni başladı: brifler dağıtılıyor, henüz kimse yerinden kalkmadı.
+    expect(ilk).not.toEqual(expect.stringContaining('id="kabin-yolu"'))
+
+    // Ekip çalışmaya başlayınca olaylar sahnenin içinde döner: Feride denetime asansörle iner.
+    await $.tool.call({ tool: 'Grep', tool_use_id: 'g1', agentId: 'a1', pattern: 'x' })
+    await o.saat.advance(9_000)
+
+    const calisirken = await bina()
+
+    expect(calisirken).toEqual(expect.stringContaining('id="kabin-yolu"'))
+
+    // Saat ilerledi diye sahne yeniden çizilmez: kaynak aynı kalır, panoda yanıp sönme olmaz.
+    for (let i = 0; i < 6; i += 1) await o.saat.advance(3_000)
+    expect(await bina()).toBe(calisirken)
+
+    // İşin durumu değişince (biri bitirince) sahne yenilenir.
+    await $.turn.complete(bitir('a2', 'ÖZET: tamam.'))
+    expect(await bina()).not.toBe(calisirken)
+    await ui.unmount()
+  })
+
   test('masaüstünde çizgi film sahnesi (SVG) çizilir', async ($, on) => {
     const o = ofis(on, [{ kind: 'five_hour', percentUsed: 20, resetsAt: SIFIRLANMA }])
 
@@ -421,21 +616,55 @@ describe('ofis panosu', () => {
     })
 
     const ui = await $.ui.mount({ plugin: 'feride', surface: 'desktop', component: 'Pane', props: PANO, requestId: PANE })
-    const ilk = await ui.find({ type: 'Svg' })
-    const kaynak = String(ilk?.props.source)
+    // Üstte sahne, altında her üyenin kendi kartı: ayrı ayrı SVG'ler.
+    const ilkler = await ui.findAll({ type: 'Svg' })
+    const kaynak = String(ilkler[0]?.props.source)
+    const arasKarti = String(ilkler[1]?.props.source)
 
+    expect(ilkler).toHaveLength(4)
     expect(kaynak).toEqual(expect.stringContaining('<svg'))
     expect(kaynak).toEqual(expect.stringContaining('PATRON FERİDE'))
     for (const ad of ['Aras', 'Bora', 'Cem']) expect(kaynak).toEqual(expect.stringContaining(ad))
-    expect(String(ilk?.props.alt)).toEqual(expect.stringContaining('Çizgi film'))
-    // Kendi genişliği yuvadan büyük: kutu panoyu ya da sohbet sütununu doldurur.
-    expect(kaynak).toEqual(expect.stringMatching(/^<svg [^>]*width="1800"/))
-    // Satır başına en çok iki üye, büyütülmüş çizilir.
-    expect(kaynak).toEqual(expect.stringContaining('scale(1.5)'))
+    expect(String(ilkler[0]?.props.alt)).toEqual(expect.stringContaining('Çizgi film'))
+    // Her çizim panonun enini doldurur: 80 sütun, sütun başına 7,5 piksel.
+    for (const svg of ilkler) expect(svg.props.width).toBe(600)
+    expect(String(ilkler[1]?.props.alt)).toEqual(expect.stringContaining('Aras (Aras rolü, usta/opus): çalışıyor'))
+    expect(String(ilkler[2]?.props.alt)).toEqual(expect.stringContaining('Bora (Bora rolü, kalfa/sonnet): sırasını bekliyor'))
 
-    // Kare ilerleyince sahne değişir: animasyon saatle yürür.
-    await o.saat.advance(3_000)
-    expect(String((await ui.find({ type: 'Svg' }))?.props.source)).not.toBe(kaynak)
+    // Saat ilerledi diye hiçbir çizim değişmez: yeniden yüklenmez, yanıp sönmez.
+    for (let i = 0; i < 4; i += 1) await o.saat.advance(3_000)
+
+    const sonrakiler = await ui.findAll({ type: 'Svg' })
+
+    expect(String(sonrakiler[0]?.props.source)).toBe(kaynak)
+    expect(String(sonrakiler[1]?.props.source)).toBe(arasKarti)
+
+    // Üyenin araç çağrısı birkaç saniye geriden yansır: ne yaptığı kartın altında yazıyla,
+    // canlandırması işin türüne göre.
+    const kart = async (): Promise<string> => String((await ui.findAll({ type: 'Svg' }))[1]?.props.source)
+
+    await $.tool.call({ tool: 'Grep', tool_use_id: 'g1', agentId: 'a1', pattern: 'aramaKutusu' })
+    await o.saat.advance(9_000)
+
+    const arayan = await kart()
+
+    expect(arayan).not.toBe(arasKarti)
+    expect(await ui.find({ type: 'Text', text: /Aras › Grep: aramaKutusu/ })).toBeDefined()
+
+    // Yeni araç çağrısının yazısı hemen değişir; canlandırma her çağrıda baştan başlamaz,
+    // en erken on beş saniye sonra değişir.
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'g2', agentId: 'a1', file_path: '/is/src/arama.ts', old_string: 'a', new_string: 'b' })
+    await o.saat.advance(9_000)
+    expect(await ui.find({ type: 'Text', text: /Aras › Edit: arama\.ts/ })).toBeDefined()
+    expect(await kart()).toBe(arayan)
+
+    await o.saat.advance(9_000)
+    expect(await kart()).not.toBe(arayan)
+
+    // Şablon düğmesi sıradaki şablona geçer.
+    expect((await ui.find({ key: 'sablon' }))?.props.label).toBe('Şablon: orta')
+    await ui.press({ key: 'sablon' })
+    expect((await ui.find({ key: 'sablon' }))?.props.label).toBe('Şablon: güçlü')
 
     await $.turn.complete(bitir('a1', 'ÖZET: tamam.\nLAF: Yine ben kurtardım.'))
     expect(o.ajanlar).toHaveLength(3)
